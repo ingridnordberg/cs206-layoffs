@@ -3,126 +3,156 @@ import pandas as pd
 import requests
 import json
 import re
-import time
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz
-from dateutil.parser import parse as parse_date
 
 # --- CONFIG ---
-st.set_page_config(page_title="Enriched News Alerts", page_icon="🗞️", layout="wide")
+st.set_page_config(page_title="Enriched News Alerts", page_icon="🕵️", layout="wide")
 
-# Initialize session state to store "Outlets Found" across searches
+# --- INITIALIZATION ---
+if 'website_cache' not in st.session_state:
+    st.session_state.website_cache = {}
 if 'outlets_cache' not in st.session_state:
     st.session_state.outlets_cache = {}
+if 'current_results' not in st.session_state:
+    st.session_state.current_results = []
 
-# --- SCRAPER LOGIC (From friend's coverage_finder.py) ---
-def is_blocked_url(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return any(host.endswith(s) for s in (".gov", ".mil"))
+# --- REINFORCED WEBSITE FINDER (v5: Domain Priority) ---
+def find_company_website(company, location, api_key):
+    # Clean name for matching (e.g., "AeroFarms" -> "aerofarms")
+    clean_name = re.sub(r'[^a-zA-Z0-9]', '', company).lower()
+    
+    query = f'"{company}" official corporate homepage'
+    url = "https://google.serper.dev/search"
+    payload = json.dumps({"q": query, "num": 10})
+    headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
+    
+    # Block portfolio sites, aggregators, and news hubs
+    BLACKLIST = [
+        'portfolio', 'investor', 'mppgrp', 'bbb.org', 'thelayoff', 'wikipedia', 
+        'linkedin', 'facebook', 'yelp', 'yellowpages', 'dandb.com', 'zoominfo', 
+        'glassdoor', 'indeed', 'blade', 'news', 'pressrelease', '.gov'
+    ]
 
-def fetch_article(url: str) -> dict:
     try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        response = requests.post(url, headers=headers, data=payload)
+        results = response.json().get('organic', [])
+        
+        candidates = []
+        for hit in results:
+            link = hit.get('link', '').lower()
+            parsed = urlparse(link)
+            domain = parsed.netloc.lower()
+            path = parsed.path.lower().strip('/')
+            
+            # 1. Immediate rejection for blacklisted domains or "portfolio" paths
+            if any(b in domain for b in BLACKLIST) or any(b in path for b in BLACKLIST):
+                continue
+            
+            # 2. Strict Intent Check: Skip if the title suggests it's just a news article
+            title = hit.get('title', '').lower()
+            if any(word in title for word in ['layoff', 'closing', 'shutdown', 'portfolio']):
+                continue
+            
+            # 3. DOMAIN MATCHING BONUS (The AeroFarms Fix)
+            # If the clean company name is the main part of the domain, give it a huge boost
+            score = len(path) # Shorter paths are better
+            if clean_name in domain.replace('www.', ''):
+                score -= 200 # Massive boost for exact brand domains
+            
+            candidates.append((score, hit.get('link')))
+
+        if candidates:
+            # Lowest score (highest boost) wins
+            candidates.sort(key=lambda x: x[0])
+            return candidates[0][1]
+        return None
+    except:
+        return None
+
+# --- INDUSTRY GUESSER ---
+def guess_industry(company_name):
+    name = str(company_name).lower()
+    mapping = {
+        'AgTech & Farming': ['farming', 'agri', 'farm', 'aero', 'vertical', 'greenhouse'],
+        'Food & Beverage': ['baking', 'bakery', 'food', 'bread'],
+        'Tech': ['space', 'systems', 'tech', 'software', 'data'],
+        'Manufacturing': ['mfg', 'factory', 'industrial', 'steel', 'parts']
+    }
+    for industry, keywords in mapping.items():
+        if any(word in name for word in keywords):
+            return industry
+    return "General Business"
+
+# --- NEWS SCRAPER ---
+def fetch_article(url):
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         soup = BeautifulSoup(r.text, "html.parser")
-        # Extract Date
-        pub_date = None
-        for attr in ["article:published_time", "og:published_time", "pubdate"]:
-            meta = soup.find("meta", attrs={"property": attr}) or soup.find("meta", attrs={"name": attr})
-            if meta:
-                pub_date = meta.get("content", "")[:10]
-                break
-        return {"text": soup.get_text()[:10000], "date": pub_date}
-    except: return {"text": "", "date": None}
+        return soup.get_text()[:5000]
+    except: return ""
 
 def run_investigation(row, api_key):
     company = row['company']
     location = row['location']
+    
+    # 1. FIND WEBSITE (Using Domain Priority Logic)
+    website = find_company_website(company, location, api_key)
+    st.session_state.website_cache[company] = website
+
+    # 2. FIND NEWS
     query = f'"{company}" layoffs {location} -site:.gov'
-    
-    r = requests.post("https://google.serper.dev/news", 
-                      headers={'X-API-KEY': api_key}, 
-                      json={"q": query})
-    
+    r = requests.post("https://google.serper.dev/news", headers={'X-API-KEY': api_key}, json={"q": query})
     hits = r.json().get('news', [])
+    
     scored_results = []
     outlets = []
-
     for hit in hits[:5]:
-        url = hit.get('link')
-        if not url or is_blocked_url(url): continue
-        
-        article = fetch_article(url)
-        # Score Logic
-        score = fuzz.partial_ratio(company.lower(), article['text'].lower())
-        
-        if score > 60: # Threshold for a "Match"
+        text = fetch_article(hit['link'])
+        score = fuzz.partial_ratio(company.lower(), text.lower())
+        if score > 60:
             outlets.append(hit.get('source', 'Unknown'))
-            scored_results.append({
-                "source": hit.get('source'),
-                "title": hit.get('title'),
-                "link": url,
-                "score": score
-            })
+            scored_results.append({"source": hit.get('source'), "title": hit.get('title'), "link": hit['link'], "score": score})
     
-    # Save to cache to show in the main table
-    st.session_state.outlets_cache[company] = ", ".join(list(set(outlets))) if outlets else "No coverage found"
+    st.session_state.outlets_cache[company] = ", ".join(list(set(outlets))) if outlets else "No news found"
     return scored_results
 
-# --- DATA PROCESSING ---
-def load_and_clean(file):
-    df = pd.read_csv(file)
-    df = df[df['is_superseded'] == False].copy()
-    df['jobs'] = pd.to_numeric(df['jobs'], errors='coerce').fillna(0).astype(int)
-    # Add a column for news outlets found
-    df['News Coverage'] = df['company'].map(st.session_state.outlets_cache).fillna("Not Analyzed")
-    return df
-
-# --- UI LAYOUT ---
-st.title("🕵️‍♂️ WARN Investigator")
-st.markdown("Select a row to fetch background context and news coverage.")
-
+# --- UI ---
+st.title("🕵️‍♂️ Enriched WARN Investigator")
 uploaded_file = st.file_uploader("Upload integrated.csv", type="csv")
 
 if uploaded_file:
-    df = load_and_clean(uploaded_file)
+    df = pd.read_csv(uploaded_file)
+    df = df[df['is_superseded'] == False].copy()
+    df['Industry'] = df['company'].apply(guess_industry)
     
-    # 1. THE MAIN TABLE
-    st.subheader("All Notices")
-    st.dataframe(df[['notice_date', 'company', 'location', 'jobs', 'News Coverage']], 
-                 use_container_width=True, height=400)
+    st.dataframe(df[['notice_date', 'company', 'Industry', 'location', 'jobs']].head(20), use_container_width=True)
 
     st.divider()
-
-    # 2. THE INVESTIGATION PANEL
     col1, col2 = st.columns([1, 2])
 
     with col1:
-        st.write("### Investigation Console")
-        to_investigate = st.selectbox("Pick a company to analyze:", df['company'].unique())
-        
-        if st.button("🚀 Start Investigative Search"):
+        to_investigate = st.selectbox("Select Company:", df['company'].unique())
+        if st.button("🚀 Run Agentic Search"):
             api_key = "57bb99cacfc8c06c15a4a046b909c95a6dd06248"
-            if not api_key:
-                st.error("Add your key to secrets.toml")
-            else:
-                selected_row = df[df['company'] == to_investigate].iloc[0]
-                results = run_investigation(selected_row, api_key)
-                st.session_state.current_results = results
-                st.rerun() # Refresh to show news in the table
+            selected_row = df[df['company'] == to_investigate].iloc[0]
+            st.session_state.current_results = run_investigation(selected_row, api_key)
+            st.rerun()
 
     with col2:
-        # 3. DYNAMIC TITLE WITH OUTLET NAMES
-        outlets_found = st.session_state.outlets_cache.get(to_investigate, "")
-        if outlets_found and outlets_found != "No coverage found":
-            st.success(f"### Reported by: {outlets_found}")
-        elif outlets_found == "No coverage found":
-            st.warning("### No News Coverage Detected")
-        else:
-            st.write("### Search Results will appear here")
+        if to_investigate in st.session_state.website_cache:
+            site = st.session_state.website_cache[to_investigate]
+            if site:
+                st.info(f"🌐 **Official Website:** [{site}]({site})")
+            else:
+                st.warning("🌐 **Website:** Not Found (Prioritized brand domains)")
+            
+            outlets = st.session_state.outlets_cache.get(to_investigate, "")
+            if outlets and outlets != "No news found":
+                st.success(f"### Reported by: {outlets}")
 
-        if 'current_results' in st.session_state:
-            for res in st.session_state.current_results:
-                with st.expander(f"{res['source']}: {res['title']}"):
-                    st.write(f"Match Score: {res['score']}%")
-                    st.write(f"[Link to Story]({res['link']})")
+            if 'current_results' in st.session_state:
+                for res in st.session_state.current_results:
+                    with st.expander(f"{res['score']}% Match - {res['title']}"):
+                        st.write(f"[Read Article]({res['link']})")
