@@ -4,6 +4,7 @@ import pandas as pd
 import requests
 import json
 import re
+import csv
 import datetime as dt
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
@@ -11,10 +12,12 @@ from rapidfuzz import fuzz
 import matplotlib.pyplot as plt
 
 # --- CONFIG ---
-st.set_page_config(page_title="Enriched News Alerts & Economic Data", page_icon="🕵️", layout="wide")
+st.set_page_config(page_title="Enriched WARN & Economic Intelligence", page_icon="🕵️", layout="wide")
 
-# --- BLS CONSTANTS ---
+# --- BLS CONSTANTS (Updated from Friend's Code) ---
 BLS_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
+FRIEND_API_KEY = "1451ccabe4de49a4af9119039e91376e"
+
 STATE_ABBR_TO_FIPS = {
     "AL":"01","AK":"02","AZ":"04","AR":"05","CA":"06","CO":"08","CT":"09","DE":"10","DC":"11",
     "FL":"12","GA":"13","HI":"15","ID":"16","IL":"17","IN":"18","IA":"19","KS":"20","KY":"21",
@@ -32,6 +35,31 @@ if 'outlets_cache' not in st.session_state:
 if 'current_results' not in st.session_state:
     st.session_state.current_results = []
 
+# --- COUNTY FIPS LOADER (Integrated from Friend's Code) ---
+@st.cache_data
+def load_county_fips(path="county_fips.csv"):
+    m = {}
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key = (row["state_abbr"].upper(), row["county_name"])
+                m[key] = row["county_fips"].zfill(5)
+    except FileNotFoundError:
+        # If the file isn't there yet, we won't crash, but we'll notify the user
+        return None
+    return m
+
+# --- SERIES BUILDERS (Integrated from Friend's Code) ---
+def laus_state_series(state_abbr, seasonal="S"):
+    fips = STATE_ABBR_TO_FIPS[state_abbr]
+    area = f"ST{fips}{'0'*11}"
+    return f"LA{seasonal}{area}03"
+
+def laus_county_series(county_fips5):
+    area = f"CN{county_fips5}{'0'*8}"
+    return f"LAU{area}03" # Counties typically NOT seasonally adjusted
+
 # --- LOGIC FUNCTIONS: INVESTIGATION ---
 def find_company_website(company, location, api_key):
     clean_name = re.sub(r'[^a-zA-Z0-9]', '', company).lower()
@@ -39,18 +67,15 @@ def find_company_website(company, location, api_key):
     url = "https://google.serper.dev/search"
     payload = json.dumps({"q": query, "num": 10})
     headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
-    BLACKLIST = ['portfolio', 'investor', 'bbb.org', 'wikipedia', 'linkedin', 'facebook', 'zoominfo', 'glassdoor']
     try:
-        response = requests.post(url, headers=headers, data=payload)
-        results = response.json().get('organic', [])
+        r = requests.post(url, headers=headers, data=payload)
+        results = r.json().get('organic', [])
         candidates = []
         for hit in results:
             link = hit.get('link', '').lower()
-            parsed = urlparse(link)
-            domain = parsed.netloc.lower()
-            if any(b in domain for b in BLACKLIST): continue
-            score = len(parsed.path)
-            if clean_name in domain: score -= 200 
+            if any(b in link for b in ['linkedin', 'facebook', 'wikipedia']): continue
+            score = len(urlparse(link).path)
+            if clean_name in link: score -= 200
             candidates.append((score, hit.get('link')))
         if candidates:
             candidates.sort(key=lambda x: x[0])
@@ -61,20 +86,14 @@ def find_company_website(company, location, api_key):
 def guess_industry(company_name):
     name = str(company_name).lower()
     mapping = {
-        'AgTech & Farming': ['farming', 'agri', 'farm', 'aero', 'vertical', 'greenhouse'],
-        'Food & Beverage': ['baking', 'bakery', 'food', 'bread', 'meat', 'dairy'],
-        'Tech': ['space', 'systems', 'tech', 'software', 'data', 'digital'],
-        'Manufacturing': ['mfg', 'factory', 'industrial', 'steel', 'parts', 'machining']
+        'AgTech & Farming': ['farming', 'agri', 'farm', 'aero', 'vertical'],
+        'Food & Beverage': ['baking', 'bakery', 'food', 'bread'],
+        'Tech': ['space', 'systems', 'tech', 'software', 'data'],
+        'Manufacturing': ['mfg', 'factory', 'industrial', 'steel']
     }
     for industry, keywords in mapping.items():
         if any(word in name for word in keywords): return industry
     return "General Business"
-
-def fetch_article(url):
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        return BeautifulSoup(r.text, "html.parser").get_text()[:5000]
-    except: return ""
 
 def run_investigation(row, api_key):
     company, location = row['company'], row['location']
@@ -84,67 +103,62 @@ def run_investigation(row, api_key):
     hits = r.json().get('news', [])
     scored_results, outlets = [], []
     for hit in hits[:5]:
-        text = fetch_article(hit['link'])
-        score = fuzz.partial_ratio(company.lower(), text.lower())
+        score = fuzz.partial_ratio(company.lower(), hit.get('title', '').lower())
         if score > 60:
             outlets.append(hit.get('source', 'Unknown'))
             scored_results.append({"source": hit.get('source'), "title": hit.get('title'), "link": hit['link'], "score": score})
     st.session_state.outlets_cache[company] = ", ".join(list(set(outlets))) if outlets else "No news found"
     return scored_results
 
-# --- LOGIC FUNCTIONS: BLS ECONOMIC DATA ---
-def laus_state_unemp_rate_series_id(state_abbr: str, seasonal: str = "S") -> str:
-    fips = STATE_ABBR_TO_FIPS.get(state_abbr)
-    if not fips: raise ValueError(f"Unknown state: {state_abbr}")
-    return f"LA{seasonal}ST{fips}{'0'*11}03"
-
-def bls_fetch(series_id: str, startyear: int, endyear: int, api_key: str | None):
-    payload = {"seriesid": [series_id], "startyear": str(startyear), "endyear": str(endyear)}
-    if api_key: payload["registrationKey"] = api_key
+# --- BLS FETCH & PARSE (Updated with Friend's Code) ---
+def bls_fetch(series_ids, startyear, endyear, api_key=FRIEND_API_KEY):
+    payload = {
+        "seriesid": series_ids,
+        "startyear": str(startyear),
+        "endyear": str(endyear),
+        "registrationKey": api_key,
+    }
     r = requests.post(BLS_URL, json=payload, timeout=25)
-    r.raise_for_status()
-    j = r.json()
-    if j.get("status") != "REQUEST_SUCCEEDED": raise RuntimeError(f"BLS request failed: {j}")
-    return j
+    return r.json()
 
-def parse_series_to_df(resp_json) -> pd.DataFrame:
-    series_list = resp_json.get("Results", {}).get("series", [])
-    if not series_list: return pd.DataFrame(columns=["date", "value"])
-    rows = []
-    for row in series_list[0].get("data", []):
-        period = row.get("period", "")
-        if not period.startswith("M"): continue
-        try:
-            rows.append((dt.date(int(row["year"]), int(period[1:]), 1), float(row["value"])))
-        except: continue
-    df = pd.DataFrame(rows, columns=["date", "value"]).sort_values("date")
-    df["date"] = pd.to_datetime(df["date"])
+def parse_monthly_to_df(resp_json):
+    # Converts friend's parse logic into a DataFrame for Streamlit
+    out = []
+    for series in resp_json.get("Results", {}).get("series", []):
+        sid = series["seriesID"]
+        for row in series["data"]:
+            if not row["period"].startswith("M"): continue
+            year, month = int(row["year"]), int(row["period"][1:])
+            v = row["value"]
+            if v == "-" or v == "": continue
+            out.append({"date": dt.date(year, month, 1), "value": float(v), "seriesID": sid})
+    df = pd.DataFrame(out)
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date')
     return df
 
-@st.cache_data(show_spinner=False)
-def get_last_5y_state_unemp(state_abbr: str, api_key: str | None, seasonal: str) -> tuple[str, pd.DataFrame]:
-    today = dt.date.today()
-    endyear, startyear = today.year, today.year - 6
-    sid = laus_state_unemp_rate_series_id(state_abbr, seasonal=seasonal)
-    resp = bls_fetch(sid, startyear=startyear, endyear=endyear, api_key=api_key)
-    df = parse_series_to_df(resp)
-    cutoff = pd.Timestamp(today.replace(year=today.year - 5, day=1)).normalize()
-    return sid, df[df["date"] >= cutoff].reset_index(drop=True)
-
-def fmt(x):
-    return "N/A" if x is None or pd.isna(x) else f"{x:.2f}"
+def fmt_val(x, suffix=""):
+    return "N/A" if x is None or pd.isna(x) else f"{x:.2f}{suffix}"
 
 # --- UI MAIN ---
 st.title("🕵️‍♂️ Enriched WARN Investigator")
 uploaded_file = st.file_uploader("Upload integrated.csv", type="csv")
 
 if uploaded_file:
-    # 1. LOAD & GLOBAL FILTERS
+    # 1. LOAD & CLEAN
     df_raw = pd.read_csv(uploaded_file)
-    df_active = df_raw[df_raw['is_superseded'] == False].copy()
-    df_active['notice_date'] = pd.to_datetime(df_active['notice_date'], errors='coerce')
-    df_active['Industry'] = df_active['company'].apply(guess_industry)
+    df_raw.columns = df_raw.columns.str.strip().str.lower()
     
+    if 'is_superseded' in df_raw.columns:
+        df_active = df_raw[df_raw['is_superseded'] == False].copy()
+    else:
+        df_active = df_raw.copy()
+
+    df_active['notice_date'] = pd.to_datetime(df_active['notice_date'], errors='coerce')
+    df_active['industry'] = df_active['company'].apply(guess_industry)
+    
+    # 2. FILTERS
     st.sidebar.header("Investigation Filters")
     unique_states = sorted(df_active['postal_code'].dropna().unique())
     selected_states = st.sidebar.multiselect("Select States:", unique_states, default=["NY", "CA"] if "NY" in unique_states else unique_states[:1])
@@ -156,7 +170,7 @@ if uploaded_file:
     
     search_query = st.sidebar.text_input("Search Company Name:")
 
-    # 2. APPLY FILTERS
+    # Apply Filters
     filtered_df = df_active.copy()
     if selected_states: filtered_df = filtered_df[filtered_df['postal_code'].isin(selected_states)]
     filtered_df = filtered_df[(filtered_df['notice_date'] >= pd.Timestamp(date_range[0])) & (filtered_df['notice_date'] <= pd.Timestamp(date_range[1]))]
@@ -164,7 +178,7 @@ if uploaded_file:
 
     # 3. SPREADSHEET & TRENDS
     st.subheader(f"📊 Filtered Layoff Records ({len(filtered_df)} entries)")
-    st.dataframe(filtered_df[['notice_date', 'company', 'Industry', 'location', 'jobs']], use_container_width=True)
+    st.dataframe(filtered_df[['notice_date', 'company', 'industry', 'location', 'jobs']], use_container_width=True)
 
     st.divider()
     st.subheader("📈 Layoff Frequency (Filtered View)")
@@ -195,40 +209,65 @@ if uploaded_file:
                     with st.expander(f"{res['score']}% Match - {res['title']}"):
                         st.write(f"[Read Article]({res['link']})")
 
-    # 5. NEW: BLS ECONOMIC CONTEXT SECTION (Appears Underneath)
+    # 5. MACROECONOMIC CONTEXT (Replaced/Upgraded with Friend's Code)
     st.divider()
     st.header("📉 Macroeconomic Context (BLS Data)")
-    st.caption("View general economic trends for the selected region.")
-
-    # Get state for BLS from sidebar; default to first selected or CA
-    bls_state = selected_states[0] if selected_states else "CA"
     
-    st.sidebar.divider()
-    st.sidebar.header("BLS API Settings")
-    seasonal_choice = st.sidebar.selectbox("BLS Seasonal adjustment", options=["S (Seasonally Adjusted)", "U (Not Adjusted)"], index=0)
-    bls_api_key = st.sidebar.text_input("BLS API Key (Optional)", value=os.environ.get("BLS_API_KEY", ""), type="password")
+    # Setup BLS selections
+    bls_state = selected_states[0] if selected_states else "CA"
+    county_map = load_county_fips()
+    
+    colA, colB = st.columns(2)
+    with colA:
+        view_type = st.radio("View BLS data by:", ["State", "County"], horizontal=True)
+    with colB:
+        if view_type == "County":
+            if county_map:
+                available_counties = [k[1] for k in county_map.keys() if k[0] == bls_state]
+                sel_county = st.selectbox("Select County:", sorted(available_counties))
+            else:
+                st.error("⚠️ `county_fips.csv` not found. Showing State data instead.")
+                view_type = "State"
+    
+    # Determine Series ID using friend's builders
+    if view_type == "County" and county_map:
+        fips = county_map[(bls_state, sel_county)]
+        series_id = laus_county_series(fips)
+        label = f"Unemployment Rate (%) — {sel_county}, {bls_state}"
+    else:
+        series_id = laus_state_series(bls_state)
+        label = f"Unemployment Rate (%) — {bls_state}"
 
+    # Fetch and Display
     try:
-        series_id, bls_df = get_last_5y_state_unemp(bls_state, bls_api_key.strip() or None, seasonal_choice[0])
+        current_year = dt.date.today().year
+        resp = bls_fetch([series_id], current_year - 5, current_year)
+        bls_df = parse_monthly_to_df(resp)
 
         if not bls_df.empty:
-            latest, start = bls_df.iloc[-1]["value"], bls_df.iloc[0]["value"]
+            # YoY Logic from Friend's code
+            latest_row = bls_df.iloc[-1]
+            cur_val = latest_row['value']
             
-            m1, m2, m3 = st.columns(3)
-            m1.metric(f"Latest Unemp. Rate ({bls_state})", f"{latest}%")
-            m2.metric("5-Year Change", f"{fmt(latest - start)} pp")
-            m3.metric("BLS Series ID", series_id)
+            # Find value from 1 year ago
+            target_date = latest_row['date'] - pd.DateOffset(years=1)
+            prev_row = bls_df[bls_df['date'] == target_date]
+            yoy_val = cur_val - prev_row.iloc[0]['value'] if not prev_row.empty else None
 
+            # Metrics
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Latest Rate", f"{fmt_val(cur_val)}%")
+            m2.metric("YoY Change", fmt_val(yoy_val, " pp"))
+            m3.metric("Series ID", series_id)
+
+            # Chart
             fig, ax = plt.subplots(figsize=(10, 4))
             ax.plot(bls_df["date"], bls_df["value"], color="#1f77b4", linewidth=2)
-            ax.set_title(f"Historical Unemployment Rate: {bls_state} (Last 5 Years)")
+            ax.set_title(label)
             ax.set_ylabel("Percentage (%)")
             ax.grid(True, alpha=0.3)
             st.pyplot(fig)
-            
-            with st.expander("View Raw BLS Data Table"):
-                st.dataframe(bls_df.rename(columns={"value": "unemployment_rate_pct"}), use_container_width=True)
         else:
-            st.warning("No economic data available for the selected state.")
+            st.warning("No economic data returned for that selection.")
     except Exception as e:
-        st.error(f"BLS Error: {e}")
+        st.error(f"BLS Fetch Error: {e}")
