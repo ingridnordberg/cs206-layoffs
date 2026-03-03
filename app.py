@@ -65,6 +65,67 @@ def laus_county_series(county_fips5):
     area = f"CN{county_fips5}{'0'*8}"
     return f"LAU{area}03"
 
+# --- NEW HELPERS ----
+def normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+def looks_like_full_address(loc: str) -> bool:
+    # If there's a street number, it's probably an address; don't use it in the query.
+    return bool(re.search(r"\b\d{1,6}\b", loc or ""))
+
+def clean_location_for_query(loc: str, state: str) -> str:
+    """
+    Convert messy location strings into something search-friendly.
+    - If missing/invalid -> state
+    - If full address -> state
+    - Else keep a short location (first chunk) + state
+    """
+    if not is_valid_loc(loc):
+        return state
+
+    loc = str(loc).strip()
+
+    # Drop super-long multi-part locations (often lists of cities)
+    if len(loc) > 60:
+        return state
+
+    if looks_like_full_address(loc):
+        return state
+
+    # If it already contains the state abbrev or a comma, keep it, else append state
+    if re.search(r"\b[A-Z]{2}\b", loc) or "," in loc:
+        return loc
+    return f"{loc}, {state}"
+
+LAYOFF_KEYWORDS = [
+    "layoff", "layoffs", "job cut", "job cuts", "cut jobs",
+    "reduction in force", "rif", "redundant", "redundancies",
+    "downsizing", "workforce reduction", "termination", "terminations",
+    "warn notice", "warn", "pink slips"
+]
+
+BAD_DOMAINS = [
+    "linkedin.com",
+    "repvue.com",
+    "glassdoor.com",
+    "indeed.com",
+    "facebook.com",
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "youtube.com",
+]
+
+def contains_layoff_signal(title: str, snippet: str) -> bool:
+    t = normalize_text(title)
+    s = normalize_text(snippet)
+    blob = f"{t} {s}"
+    return any(k in blob for k in LAYOFF_KEYWORDS)
+
+def domain_is_bad(url: str) -> bool:
+    u = (url or "").lower()
+    return any(d in u for d in BAD_DOMAINS)
+
 # --- LOGIC FUNCTIONS ---
 @st.cache_data
 def fetch_census_workforce_trend(geography_type, state_abbr, county_fips5=None, start_year=2018, end_year=2023):
@@ -163,20 +224,107 @@ def guess_industry(company_name):
         if any(word in name for word in keywords): return industry
     return "General Business"
 
+
+# --- NEW INVESTIGATION VIBE ---
 def run_investigation(row, api_key):
-    company = row['company']
-    location = row['location'] if is_valid_loc(row['location']) else row['postal_code']
-    st.session_state.website_cache[company] = find_company_website(company, row['location'], api_key)
-    query = f'"{company}" layoffs {location} -site:.gov'
-    r = requests.post("https://google.serper.dev/news", headers={'X-API-KEY': api_key}, json={"q": query})
-    hits = r.json().get('news', [])
-    scored_results, outlets = [], []
-    for hit in hits[:5]:
-        score = fuzz.partial_ratio(company.lower(), hit.get('title', '').lower())
-        if score > 60:
-            outlets.append(hit.get('source', 'Unknown'))
-            scored_results.append({"source": hit.get('source'), "title": hit.get('title'), "link": hit['link'], "score": score})
-    st.session_state.outlets_cache[company] = ", ".join(list(set(outlets))) if outlets else "No news found"
+    company = row["company"]
+    state = (row.get("postal_code") or "").strip().upper()
+    raw_loc = row.get("location")
+
+    # Website search (same as before)
+    # st.session_state.website_cache[company] = find_company_website(company, raw_loc, api_key)
+    st.session_state.website_cache[company] = find_company_website(
+        company,
+        row['location'],   
+        api_key
+    )
+
+    # Build a safer query (avoid over-specific addresses)
+    loc_for_query = clean_location_for_query(raw_loc, state)
+    query = f'"{company}" ({ "layoffs OR \"job cuts\" OR \"WARN notice\"" }) {loc_for_query} -site:.gov'
+
+    r = requests.post(
+        "https://google.serper.dev/news",
+        headers={"X-API-KEY": api_key},
+        json={"q": query, "num": 20},   # <--- BIG: request more than 5
+        timeout=20
+    )
+
+    hits = r.json().get("news", []) or []
+
+    # Score + filter
+    scored_results = []
+    outlets = set()
+
+    for hit in hits:
+        title = hit.get("title", "") or ""
+        snippet = hit.get("snippet", "") or ""
+        link = hit.get("link", "") or ""
+        source = hit.get("source", "Unknown")
+
+        if not link or domain_is_bad(link):
+            continue
+
+        # Company name match (keep your fuzz logic, but more forgiving)
+        score = fuzz.partial_ratio(company.lower(), title.lower())
+
+        # Topic gate: must look like layoffs/WARN somewhere in title/snippet
+        # Allow very high company-match scores to pass even if keyword is missing
+        topic_ok = contains_layoff_signal(title, snippet)
+        if not topic_ok and score < 90:
+            continue
+
+        if score >= 55:  # slightly looser than 60 to reduce “nothing found”
+            outlets.add(source)
+            scored_results.append({
+                "source": source,
+                "title": title,
+                "link": link,
+                "score": score,
+            })
+
+        # keep it tight
+        if len(scored_results) >= 8:
+            break
+
+    # If we found nothing, fall back to a broader query (no location)
+    if not scored_results:
+        fallback_query = f'"{company}" (layoffs OR "job cuts" OR "WARN notice") -site:.gov'
+        r2 = requests.post(
+            "https://google.serper.dev/news",
+            headers={"X-API-KEY": api_key},
+            json={"q": fallback_query, "num": 20},
+            timeout=20
+        )
+        hits2 = r2.json().get("news", []) or []
+
+        for hit in hits2:
+            title = hit.get("title", "") or ""
+            snippet = hit.get("snippet", "") or ""
+            link = hit.get("link", "") or ""
+            source = hit.get("source", "Unknown")
+
+            if not link or domain_is_bad(link):
+                continue
+
+            score = fuzz.partial_ratio(company.lower(), title.lower())
+            topic_ok = contains_layoff_signal(title, snippet)
+            if not topic_ok and score < 90:
+                continue
+
+            if score >= 55:
+                outlets.add(source)
+                scored_results.append({
+                    "source": source,
+                    "title": title,
+                    "link": link,
+                    "score": score,
+                })
+
+            if len(scored_results) >= 8:
+                break
+
+    st.session_state.outlets_cache[company] = ", ".join(sorted(outlets)) if outlets else "No news found"
     return scored_results
 
 def bls_fetch(series_ids, startyear, endyear, api_key=FRIEND_API_KEY):
@@ -243,25 +391,52 @@ if uploaded_file:
                     bls_df = parse_monthly_to_df(resp)
                 except: pass
             st.info(generate_narrative(selected_row, df_active, bls_df))
-        
-        st.write("### 🤖 What is Agentic Search?")
-        st.caption("When you click this button, the tool automatically searches the web for the company’s official website and recent news coverage about the layoff. It does not generate summaries or rewrite articles – we simply find relevant links and show you the original sources so you can verify them yourself. Agentic search simply means the system can take a small action on your behalf– such as running a web search– instead of requiring you to open a new tab and do it manually.")
-
-        if st.button("🚀 Run Agentic Search"):
+    
+    with col2:
+        if st.button("🚀 Run Agentic Search", help="Search the web and show relevant source links."):
             api_key = "57bb99cacfc8c06c15a4a046b909c95a6dd06248"
-            st.session_state.current_results = run_investigation(selected_row, api_key)
+            with st.spinner("Searching..."):
+                st.session_state.current_results = run_investigation(selected_row, api_key)
             st.rerun()
 
-    with col2:
-        if to_investigate in st.session_state.website_cache:
-            site = st.session_state.website_cache[to_investigate]
-            if site: st.info(f"🌐 **Official Website:** [{site}]({site})")
+        # Show caption ONLY before search has run
+        if not st.session_state.get("current_results"):
+            st.caption(
+                "When you run Agentic Search, the tool searches the web for recent "
+                "news coverage about the selected company/layoff and shows you links "
+                "to the original sources."
+            )
+
+        # Show results after search
+        if st.session_state.get("current_results") is not None:
             outlets = st.session_state.outlets_cache.get(to_investigate, "")
-            if outlets and outlets != "No news found": st.success(f"### Reported by: {outlets}")
-            if 'current_results' in st.session_state:
-                for res in st.session_state.current_results:
-                    with st.expander(f"{res['score']}% Match - {res['title']}"):
-                        st.write(f"[Read Article]({res['link']})")
+
+            if outlets == "No news found":
+                st.warning("No matching layoff/WARN news found for this query.")
+            elif outlets:
+                st.success(f"### Reported by: {outlets}")
+
+            for res in st.session_state.current_results:
+                with st.expander(f"{res['title']}"):
+                    st.write(f"[Read Article]({res['link']})")
+
+    # with col2:
+    #     if st.button("🚀 Run Agentic Search", help="Search the web and show relevant source links."):
+    #         api_key = "57bb99cacfc8c06c15a4a046b909c95a6dd06248"
+    #         with st.spinner("Searching..."):
+    #             st.session_state.current_results = run_investigation(selected_row, api_key)
+    #         st.rerun()
+    #     st.caption("When you run Agentic Search, the tool the tool searches the web for recent news coverage about the selected company/layoff and shows you links to the original sources.\n\n")
+    #     if to_investigate in st.session_state.website_cache:
+    #         outlets = st.session_state.outlets_cache.get(to_investigate, "")
+    #         if outlets == "No news found":
+    #             st.warning("No matching layoff/WARN news found for this query.")
+    #         else:
+    #             st.success(f"### Reported by: {outlets}")
+    #         if 'current_results' in st.session_state:
+    #             for res in st.session_state.current_results:
+    #                 with st.expander(f"{res['score']}% Match - {res['title']}"):
+    #                     st.write(f"[Read Article]({res['link']})")
 
     st.divider()
     st.subheader("📈 Layoff Frequency (Filtered View)")
