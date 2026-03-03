@@ -245,8 +245,8 @@ if uploaded_file:
             st.info(generate_narrative(selected_row, df_active, bls_df))
         
         st.write("### 🤖 What is Agentic Search?")
-        st.caption("Unlike a standard search, **Agentic Search** acts as an autonomous researcher. It performs multi-step reasoning to filter noise, verify official sources, and synthesize data from across the web into actionable intelligence.")
-        
+        st.caption("When you click this button, the tool automatically searches the web for the company’s official website and recent news coverage about the layoff. It does not generate summaries or rewrite articles – we simply find relevant links and show you the original sources so you can verify them yourself. Agentic search simply means the system can take a small action on your behalf– such as running a web search– instead of requiring you to open a new tab and do it manually.")
+
         if st.button("🚀 Run Agentic Search"):
             api_key = "57bb99cacfc8c06c15a4a046b909c95a6dd06248"
             st.session_state.current_results = run_investigation(selected_row, api_key)
@@ -283,6 +283,11 @@ if uploaded_file:
             curr_county_fips = county_map[(bls_state, sel_county)]
         elif view_type == "County": st.error("⚠️ `county_fips.csv` not found."); view_type = "State"
 
+    # Define common dark theme parameters
+    app_background_color = "#0e1117"
+    text_color = "#fafafa"
+    grid_color = "#444444"
+
     series_id = laus_county_series(curr_county_fips) if view_type == "County" and curr_county_fips else laus_state_series(bls_state)
     try:
         bls_df = parse_monthly_to_df(bls_fetch([series_id], dt.date.today().year - 5, dt.date.today().year))
@@ -291,8 +296,21 @@ if uploaded_file:
             m1.metric("Latest Unemployment", f"{fmt_val(bls_df.iloc[-1]['value'])}%")
             m3.metric("BLS Series ID", series_id)
             fig, ax = plt.subplots(figsize=(10, 3))
-            ax.plot(bls_df["date"], bls_df["value"], color="#1f77b4", linewidth=2)
-            ax.set_title(f"Unemployment Rate (%) — {sel_county if view_type == 'County' else bls_state}"); ax.set_ylabel("Rate (%)"); ax.grid(True, alpha=0.3); st.pyplot(fig)
+            
+            fig.patch.set_facecolor(app_background_color)
+            ax.set_facecolor(app_background_color)
+            ax.bar(bls_df["date"], bls_df["value"], color="#1f77b4", width=20) 
+            ax.set_title(f"Unemployment Rate (%) — {sel_county if view_type == 'County' else bls_state}", color=text_color)
+            
+            # --- Added Labels ---
+            ax.set_xlabel("Notice Month", color=text_color)
+            ax.set_ylabel("Unemployment Rate (%)", color=text_color)
+            
+            ax.tick_params(axis='x', colors=text_color)
+            ax.tick_params(axis='y', colors=text_color)
+            ax.grid(True, alpha=0.3, color=grid_color)
+            plt.tight_layout()
+            st.pyplot(fig)
     except Exception as e: st.error(f"BLS Error: {e}")
 
     st.divider()
@@ -302,7 +320,22 @@ if uploaded_file:
         if not pop_df.empty:
             st.metric("Latest Population", f"{pop_df.iloc[-1]['population']:,}")
             fig2, ax2 = plt.subplots(figsize=(10, 3))
-            ax2.plot(pop_df["year"], pop_df["population"], marker='o', color="#2ca02c", linewidth=2); ax2.set_title("Total Population Trend (ACS 5-year)"); ax2.grid(True, alpha=0.3); ax2.set_xticks(pop_df["year"]); st.pyplot(fig2)
+            
+            fig2.patch.set_facecolor(app_background_color)
+            ax2.set_facecolor(app_background_color)
+            ax2.bar(pop_df["year"], pop_df["population"], color="#2ca02c")
+            ax2.set_title("Total Population Trend (ACS 5-year)", color=text_color)
+            
+            # --- Added Labels ---
+            ax2.set_xlabel("Year", color=text_color)
+            ax2.set_ylabel("Total Population", color=text_color)
+            
+            ax2.tick_params(axis='x', colors=text_color)
+            ax2.tick_params(axis='y', colors=text_color)
+            ax2.grid(True, alpha=0.3, color=grid_color)
+            ax2.set_xticks(pop_df["year"])
+            plt.tight_layout()
+            st.pyplot(fig2)
     except Exception as e: st.error(f"Census Pop Error: {e}")
 
     st.divider()
@@ -312,5 +345,20 @@ if uploaded_file:
         if not work_df.empty:
             st.metric("Latest Labor Force Size", f"{work_df.iloc[-1]['workforce']:,}")
             fig3, ax3 = plt.subplots(figsize=(10, 3))
-            ax3.plot(work_df["year"], work_df["workforce"], marker='s', color="#9467bd", linewidth=2); ax3.set_title("Total Labor Force Trend (ACS 5-year)"); ax3.set_ylabel("Labor Force Count"); ax3.grid(True, alpha=0.3); ax3.set_xticks(work_df["year"]); st.pyplot(fig3)
+            
+            fig3.patch.set_facecolor(app_background_color)
+            ax3.set_facecolor(app_background_color)
+            ax3.bar(work_df["year"], work_df["workforce"], color="#9467bd")
+            ax3.set_title("Total Labor Force Trend (ACS 5-year)", color=text_color)
+            
+            # --- Added Labels ---
+            ax3.set_xlabel("Year", color=text_color)
+            ax3.set_ylabel("Labor Force Count", color=text_color)
+            
+            ax3.tick_params(axis='x', colors=text_color)
+            ax3.tick_params(axis='y', colors=text_color)
+            ax3.grid(True, alpha=0.3, color=grid_color)
+            ax3.set_xticks(work_df["year"])
+            plt.tight_layout()
+            st.pyplot(fig3)
     except Exception as e: st.error(f"Census Workforce Error: {e}")
