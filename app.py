@@ -14,9 +14,10 @@ import matplotlib.pyplot as plt
 # --- CONFIG ---
 st.set_page_config(page_title="Enriched WARN & Economic Intelligence", page_icon="🕵️", layout="wide")
 
-# --- BLS CONSTANTS ---
+# --- CONSTANTS ---
 BLS_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
 FRIEND_API_KEY = "1451ccabe4de49a4af9119039e91376e"
+CENSUS_API_BASE = "https://api.census.gov/data"
 
 STATE_ABBR_TO_FIPS = {
     "AL":"01","AK":"02","AZ":"04","AR":"05","CA":"06","CO":"08","CT":"09","DE":"10","DC":"11",
@@ -66,6 +67,34 @@ def laus_county_series(county_fips5):
     return f"LAU{area}03"
 
 # --- LOGIC FUNCTIONS ---
+@st.cache_data
+def fetch_census_population_trend(geography_type, state_abbr, county_fips5=None, start_year=2018, end_year=2023):
+    """Fetches a 5-year population trend from Census ACS5 API."""
+    data = []
+    state_fips = STATE_ABBR_TO_FIPS.get(state_abbr)
+    if not state_fips: return pd.DataFrame()
+
+    for year in range(start_year, end_year + 1):
+        try:
+            url = f"{CENSUS_API_BASE}/{year}/acs/acs5"
+            if geography_type == "State":
+                params = {"get": "B01003_001E", "for": f"state:{state_fips}"}
+            else:
+                if not county_fips5: continue
+                # Split 5-digit FIPS into 2-digit state and 3-digit county
+                s_fips2, c_fips3 = county_fips5[:2], county_fips5[2:]
+                params = {"get": "B01003_001E", "for": f"county:{c_fips3}", "in": f"state:{s_fips2}"}
+            
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                res = r.json()
+                if len(res) > 1:
+                    pop = int(res[1][0])
+                    data.append({"year": year, "population": pop})
+        except:
+            continue
+    return pd.DataFrame(data)
+
 def generate_narrative(company_row, full_df, bls_df):
     company = company_row['company']
     location = company_row['location']
@@ -75,7 +104,6 @@ def generate_narrative(company_row, full_df, bls_df):
     
     loc_display = location if is_valid_loc(location) else f"the state of {state}"
     
-    # 1. CONTEXT: BLS Trends
     bls_text = "Local economic trend data is currently unavailable."
     if bls_df is not None and not bls_df.empty:
         latest_rate = bls_df.iloc[-1]['value']
@@ -84,7 +112,6 @@ def generate_narrative(company_row, full_df, bls_df):
         trend = "increased" if latest_rate > old_rate else "decreased" if latest_rate < old_rate else "stagnated"
         bls_text = f"Over the past 6 months, unemployment in this region has {trend}, moving from {old_rate}% to {latest_rate}%."
 
-    # 2. RECURRING ACTIVITY (Only if location is valid)
     recurring_text = ""
     if is_valid_loc(location):
         ninety_days_ago = date - pd.Timedelta(days=90)
@@ -97,14 +124,12 @@ def generate_narrative(company_row, full_df, bls_df):
         total_90 = recent_warns['jobs'].sum()
         recurring_text = f"\n\n**Recurring Activity:** This is the **{count_90}th** WARN notice filed in **{location}** in the past 90 days, totaling **{int(total_90) if not pd.isna(total_90) else 'Unknown'}** layoffs in this immediate area."
     else:
-        # Fallback: State-wide context if county is missing
         state_warns = full_df[
             (full_df['postal_code'] == state) & 
             (full_df['notice_date'] >= (date - pd.Timedelta(days=30)))
         ]
         recurring_text = f"\n\n**Regional Context:** In the last 30 days, there have been {len(state_warns)} total WARN filings across {state}."
 
-    # 3. ASSEMBLY
     job_str = f"{int(jobs)}" if not pd.isna(jobs) else "an unspecified number of"
     narrative = f"**Context:** In {date.strftime('%B %Y')}, **{company}** announced **{job_str}** layoffs in **{loc_display}**. {bls_text}{recurring_text}"
     return narrative
@@ -233,8 +258,6 @@ if uploaded_file:
         
         if to_investigate:
             selected_row = filtered_df[filtered_df['company'] == to_investigate].iloc[0]
-            
-            # Clean location for display
             display_loc = selected_row['location'] if is_valid_loc(selected_row['location']) else "Unknown Location"
             st.write(f"📍 **Location:** {display_loc}")
             
@@ -265,7 +288,7 @@ if uploaded_file:
                     with st.expander(f"{res['score']}% Match - {res['title']}"):
                         st.write(f"[Read Article]({res['link']})")
 
-    # TRENDS & BLS
+    # TRENDS
     st.divider()
     st.subheader("📈 Layoff Frequency (Filtered View)")
     chart_data = filtered_df.dropna(subset=['notice_date', 'jobs'])
@@ -273,25 +296,28 @@ if uploaded_file:
         monthly_trend = chart_data.set_index('notice_date').resample('MS')['jobs'].sum().reset_index()
         st.bar_chart(data=monthly_trend, x='notice_date', y='jobs', color="#ff4b4b")
 
+    # MACROECONOMIC CONTEXT
     st.divider()
-    st.header("📉 Macroeconomic Context (BLS Data)")
+    st.header("📉 Macroeconomic Context (BLS & Census Data)")
     bls_state = selected_states[0] if selected_states else "CA"
     county_map = load_county_fips()
     colA, colB = st.columns(2)
     with colA:
-        view_type = st.radio("View BLS data by:", ["State", "County"], horizontal=True)
+        view_type = st.radio("View regional data by:", ["State", "County"], horizontal=True)
     with colB:
+        curr_county_fips = None
         if view_type == "County":
             if county_map:
                 available_counties = [k[1] for k in county_map.keys() if k[0] == bls_state]
                 sel_county = st.selectbox("Select County:", sorted(available_counties))
+                curr_county_fips = county_map[(bls_state, sel_county)]
             else:
                 st.error("⚠️ `county_fips.csv` not found.")
                 view_type = "State"
     
-    if view_type == "County" and county_map:
-        fips = county_map[(bls_state, sel_county)]
-        series_id = laus_county_series(fips)
+    # 1. Unemployment Rate (BLS)
+    if view_type == "County" and curr_county_fips:
+        series_id = laus_county_series(curr_county_fips)
         label = f"Unemployment Rate (%) — {sel_county}, {bls_state}"
     else:
         series_id = laus_state_series(bls_state)
@@ -308,13 +334,37 @@ if uploaded_file:
             prev_row = bls_df[bls_df['date'] == target_date]
             yoy_val = cur_val - prev_row.iloc[0]['value'] if not prev_row.empty else None
             m1, m2, m3 = st.columns(3)
-            m1.metric("Latest Rate", f"{fmt_val(cur_val)}%")
+            m1.metric("Latest Unemployment", f"{fmt_val(cur_val)}%")
             m2.metric("YoY Change", fmt_val(yoy_val, " pp"))
-            m3.metric("Series ID", series_id)
+            m3.metric("BLS Series ID", series_id)
+            
             fig, ax = plt.subplots(figsize=(10, 3))
             ax.plot(bls_df["date"], bls_df["value"], color="#1f77b4", linewidth=2)
             ax.set_title(label)
+            ax.set_ylabel("Rate (%)")
             ax.grid(True, alpha=0.3)
             st.pyplot(fig)
     except Exception as e:
         st.error(f"BLS Fetch Error: {e}")
+
+    # 2. Population Trend (Census API)
+    st.divider()
+    st.subheader(f"👥 Population Context — {sel_county if view_type == 'County' else bls_state}")
+    try:
+        pop_df = fetch_census_population_trend(view_type, bls_state, curr_county_fips)
+        if not pop_df.empty:
+            latest_pop = pop_df.iloc[-1]['population']
+            st.metric("Latest Population (ACS5)", f"{latest_pop:,}")
+            
+            fig2, ax2 = plt.subplots(figsize=(10, 3))
+            ax2.plot(pop_df["year"], pop_df["population"], marker='o', color="#2ca02c", linewidth=2)
+            ax2.set_title(f"Total Population Trend (ACS 5-year) — {sel_county if view_type == 'County' else bls_state}")
+            ax2.set_ylabel("Population")
+            ax2.grid(True, alpha=0.3)
+            # Ensure integer years on x-axis
+            ax2.set_xticks(pop_df["year"])
+            st.pyplot(fig2)
+        else:
+            st.warning("No Census population data returned for that selection.")
+    except Exception as e:
+        st.error(f"Census API Error: {e}")
