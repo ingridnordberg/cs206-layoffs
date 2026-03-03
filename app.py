@@ -68,30 +68,24 @@ def laus_county_series(county_fips5):
 # --- LOGIC FUNCTIONS ---
 @st.cache_data
 def fetch_census_workforce_trend(geography_type, state_abbr, county_fips5=None, start_year=2018, end_year=2023):
-    """Fetches 5-year workforce size (Labor Force) from Census ACS5 (B23025_002E)."""
     data = []
     state_fips = STATE_ABBR_TO_FIPS.get(state_abbr)
     if not state_fips: return pd.DataFrame()
-
     for year in range(start_year, end_year + 1):
         try:
             url = f"{CENSUS_API_BASE}/{year}/acs/acs5"
-            # B23025_002E = Estimate!!Total:!!In labor force
             if geography_type == "State":
                 params = {"get": "B23025_002E", "for": f"state:{state_fips}"}
             else:
                 if not county_fips5: continue
                 s_fips2, c_fips3 = county_fips5[:2], county_fips5[2:]
                 params = {"get": "B23025_002E", "for": f"county:{c_fips3}", "in": f"state:{s_fips2}"}
-            
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
                 res = r.json()
                 if len(res) > 1:
-                    workforce = int(res[1][0])
-                    data.append({"year": year, "workforce": workforce})
-        except:
-            continue
+                    data.append({"year": year, "workforce": int(res[1][0])})
+        except: continue
     return pd.DataFrame(data)
 
 @st.cache_data
@@ -99,7 +93,6 @@ def fetch_census_population_trend(geography_type, state_abbr, county_fips5=None,
     data = []
     state_fips = STATE_ABBR_TO_FIPS.get(state_abbr)
     if not state_fips: return pd.DataFrame()
-
     for year in range(start_year, end_year + 1):
         try:
             url = f"{CENSUS_API_BASE}/{year}/acs/acs5"
@@ -109,15 +102,12 @@ def fetch_census_population_trend(geography_type, state_abbr, county_fips5=None,
                 if not county_fips5: continue
                 s_fips2, c_fips3 = county_fips5[:2], county_fips5[2:]
                 params = {"get": "B01003_001E", "for": f"county:{c_fips3}", "in": f"state:{s_fips2}"}
-            
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
                 res = r.json()
                 if len(res) > 1:
-                    pop = int(res[1][0])
-                    data.append({"year": year, "population": pop})
-        except:
-            continue
+                    data.append({"year": year, "population": int(res[1][0])})
+        except: continue
     return pd.DataFrame(data)
 
 def generate_narrative(company_row, full_df, bls_df):
@@ -127,7 +117,6 @@ def generate_narrative(company_row, full_df, bls_df):
     date = company_row['notice_date']
     state = company_row['postal_code']
     loc_display = location if is_valid_loc(location) else f"the state of {state}"
-    
     bls_text = "Local economic trend data is currently unavailable."
     if bls_df is not None and not bls_df.empty:
         latest_rate = bls_df.iloc[-1]['value']
@@ -135,17 +124,13 @@ def generate_narrative(company_row, full_df, bls_df):
         old_rate = bls_df.iloc[old_idx]['value']
         trend = "increased" if latest_rate > old_rate else "decreased" if latest_rate < old_rate else "stagnated"
         bls_text = f"Over the past 6 months, unemployment in this region has {trend}, moving from {old_rate}% to {latest_rate}%."
-
     recurring_text = ""
     if is_valid_loc(location):
         ninety_days_ago = date - pd.Timedelta(days=90)
-        recent_warns = full_df[
-            (full_df['location'] == location) & (full_df['notice_date'] >= ninety_days_ago) & (full_df['notice_date'] <= date)
-        ]
+        recent_warns = full_df[(full_df['location'] == location) & (full_df['notice_date'] >= ninety_days_ago) & (full_df['notice_date'] <= date)]
         count_90 = len(recent_warns)
         total_90 = recent_warns['jobs'].sum()
         recurring_text = f"\n\n**Recurring Activity:** This is the **{count_90}th** WARN notice filed in **{location}** in the past 90 days, totaling **{int(total_90) if not pd.isna(total_90) else 'Unknown'}** layoffs."
-    
     job_str = f"{int(jobs)}" if not pd.isna(jobs) else "an unspecified number of"
     return f"**Context:** In {date.strftime('%B %Y')}, **{company}** announced **{job_str}** layoffs in **{loc_display}**. {bls_text}{recurring_text}"
 
@@ -154,10 +139,9 @@ def find_company_website(company, location, api_key):
     loc_query = location if is_valid_loc(location) else ""
     query = f'"{company}" {loc_query} official corporate homepage'
     url = "https://google.serper.dev/search"
-    payload = json.dumps({"q": query, "num": 10})
     headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
     try:
-        r = requests.post(url, headers=headers, data=payload)
+        r = requests.post(url, headers=headers, data=json.dumps({"q": query, "num": 10}))
         results = r.json().get('organic', [])
         candidates = []
         for hit in results:
@@ -174,12 +158,7 @@ def find_company_website(company, location, api_key):
 
 def guess_industry(company_name):
     name = str(company_name).lower()
-    mapping = {
-        'AgTech & Farming': ['farming', 'agri', 'farm', 'aero', 'vertical'],
-        'Food & Beverage': ['baking', 'bakery', 'food', 'bread'],
-        'Tech': ['space', 'systems', 'tech', 'software', 'data'],
-        'Manufacturing': ['mfg', 'factory', 'industrial', 'steel']
-    }
+    mapping = {'AgTech & Farming': ['farming', 'agri', 'farm', 'aero', 'vertical'], 'Food & Beverage': ['baking', 'bakery', 'food', 'bread'], 'Tech': ['space', 'systems', 'tech', 'software', 'data'], 'Manufacturing': ['mfg', 'factory', 'industrial', 'steel']}
     for industry, keywords in mapping.items():
         if any(word in name for word in keywords): return industry
     return "General Business"
@@ -201,8 +180,7 @@ def run_investigation(row, api_key):
     return scored_results
 
 def bls_fetch(series_ids, startyear, endyear, api_key=FRIEND_API_KEY):
-    payload = {"seriesid": series_ids, "startyear": str(startyear), "endyear": str(endyear), "registrationKey": api_key}
-    r = requests.post(BLS_URL, json=payload, timeout=25)
+    r = requests.post(BLS_URL, json={"seriesid": series_ids, "startyear": str(startyear), "endyear": str(endyear), "registrationKey": api_key}, timeout=25)
     return r.json()
 
 def parse_monthly_to_df(resp_json):
@@ -221,13 +199,11 @@ def parse_monthly_to_df(resp_json):
         df = df.sort_values('date')
     return df
 
-def fmt_val(x, suffix=""):
-    return "N/A" if x is None or pd.isna(x) else f"{x:.2f}{suffix}"
+def fmt_val(x, suffix=""): return "N/A" if x is None or pd.isna(x) else f"{x:.2f}{suffix}"
 
 # --- UI MAIN ---
 st.title("🕵️‍♂️ Enriched WARN Investigator")
 uploaded_file = st.file_uploader("Upload integrated.csv", type="csv")
-
 bls_df = pd.DataFrame() 
 
 if uploaded_file:
@@ -263,12 +239,14 @@ if uploaded_file:
             if bls_df.empty:
                 try:
                     state_code = selected_row['postal_code']
-                    temp_series = laus_state_series(state_code)
-                    resp = bls_fetch([temp_series], dt.date.today().year - 1, dt.date.today().year)
+                    resp = bls_fetch([laus_state_series(state_code)], dt.date.today().year - 1, dt.date.today().year)
                     bls_df = parse_monthly_to_df(resp)
                 except: pass
-            story = generate_narrative(selected_row, df_active, bls_df)
-            st.info(story)
+            st.info(generate_narrative(selected_row, df_active, bls_df))
+        
+        st.write("### 🤖 What is Agentic Search?")
+        st.caption("Unlike a standard search, **Agentic Search** acts as an autonomous researcher. It performs multi-step reasoning to filter noise, verify official sources, and synthesize data from across the web into actionable intelligence.")
+        
         if st.button("🚀 Run Agentic Search"):
             api_key = "57bb99cacfc8c06c15a4a046b909c95a6dd06248"
             st.session_state.current_results = run_investigation(selected_row, api_key)
@@ -289,8 +267,7 @@ if uploaded_file:
     st.subheader("📈 Layoff Frequency (Filtered View)")
     chart_data = filtered_df.dropna(subset=['notice_date', 'jobs'])
     if not chart_data.empty:
-        monthly_trend = chart_data.set_index('notice_date').resample('MS')['jobs'].sum().reset_index()
-        st.bar_chart(data=monthly_trend, x='notice_date', y='jobs', color="#ff4b4b")
+        st.bar_chart(data=chart_data.set_index('notice_date').resample('MS')['jobs'].sum().reset_index(), x='notice_date', y='jobs', color="#ff4b4b")
 
     st.divider()
     st.header("📉 Macroeconomic Context (BLS & Census Data)")
@@ -300,34 +277,24 @@ if uploaded_file:
     with colA: view_type = st.radio("View regional data by:", ["State", "County"], horizontal=True)
     with colB:
         curr_county_fips = None
-        if view_type == "County":
-            if county_map:
-                available_counties = [k[1] for k in county_map.keys() if k[0] == bls_state]
-                sel_county = st.selectbox("Select County:", sorted(available_counties))
-                curr_county_fips = county_map[(bls_state, sel_county)]
-            else:
-                st.error("⚠️ `county_fips.csv` not found.")
-                view_type = "State"
-    
-    # 1. Unemployment Rate (BLS)
+        if view_type == "County" and county_map:
+            available_counties = [k[1] for k in county_map.keys() if k[0] == bls_state]
+            sel_county = st.selectbox("Select County:", sorted(available_counties))
+            curr_county_fips = county_map[(bls_state, sel_county)]
+        elif view_type == "County": st.error("⚠️ `county_fips.csv` not found."); view_type = "State"
+
     series_id = laus_county_series(curr_county_fips) if view_type == "County" and curr_county_fips else laus_state_series(bls_state)
     try:
-        current_year = dt.date.today().year
-        resp = bls_fetch([series_id], current_year - 5, current_year)
-        bls_df = parse_monthly_to_df(resp)
+        bls_df = parse_monthly_to_df(bls_fetch([series_id], dt.date.today().year - 5, dt.date.today().year))
         if not bls_df.empty:
             m1, m2, m3 = st.columns(3)
             m1.metric("Latest Unemployment", f"{fmt_val(bls_df.iloc[-1]['value'])}%")
             m3.metric("BLS Series ID", series_id)
             fig, ax = plt.subplots(figsize=(10, 3))
             ax.plot(bls_df["date"], bls_df["value"], color="#1f77b4", linewidth=2)
-            ax.set_title(f"Unemployment Rate (%) — {sel_county if view_type == 'County' else bls_state}")
-            ax.set_ylabel("Rate (%)")
-            ax.grid(True, alpha=0.3)
-            st.pyplot(fig)
+            ax.set_title(f"Unemployment Rate (%) — {sel_county if view_type == 'County' else bls_state}"); ax.set_ylabel("Rate (%)"); ax.grid(True, alpha=0.3); st.pyplot(fig)
     except Exception as e: st.error(f"BLS Error: {e}")
 
-    # 2. Population Trend
     st.divider()
     st.subheader(f"👥 Population Context — {sel_county if view_type == 'County' else bls_state}")
     try:
@@ -335,14 +302,9 @@ if uploaded_file:
         if not pop_df.empty:
             st.metric("Latest Population", f"{pop_df.iloc[-1]['population']:,}")
             fig2, ax2 = plt.subplots(figsize=(10, 3))
-            ax2.plot(pop_df["year"], pop_df["population"], marker='o', color="#2ca02c", linewidth=2)
-            ax2.set_title("Total Population Trend (ACS 5-year)")
-            ax2.grid(True, alpha=0.3)
-            ax2.set_xticks(pop_df["year"])
-            st.pyplot(fig2)
+            ax2.plot(pop_df["year"], pop_df["population"], marker='o', color="#2ca02c", linewidth=2); ax2.set_title("Total Population Trend (ACS 5-year)"); ax2.grid(True, alpha=0.3); ax2.set_xticks(pop_df["year"]); st.pyplot(fig2)
     except Exception as e: st.error(f"Census Pop Error: {e}")
 
-    # 3. WORKFORCE SIZE (Labor Force)
     st.divider()
     st.subheader(f"💼 Total Workforce Size — {sel_county if view_type == 'County' else bls_state}")
     try:
@@ -350,12 +312,5 @@ if uploaded_file:
         if not work_df.empty:
             st.metric("Latest Labor Force Size", f"{work_df.iloc[-1]['workforce']:,}")
             fig3, ax3 = plt.subplots(figsize=(10, 3))
-            ax3.plot(work_df["year"], work_df["workforce"], marker='s', color="#9467bd", linewidth=2)
-            ax3.set_title("Total Labor Force Trend (ACS 5-year)")
-            ax3.set_ylabel("Labor Force Count")
-            ax3.grid(True, alpha=0.3)
-            ax3.set_xticks(work_df["year"])
-            st.pyplot(fig3)
-        else:
-            st.warning("No Labor Force data found.")
+            ax3.plot(work_df["year"], work_df["workforce"], marker='s', color="#9467bd", linewidth=2); ax3.set_title("Total Labor Force Trend (ACS 5-year)"); ax3.set_ylabel("Labor Force Count"); ax3.grid(True, alpha=0.3); ax3.set_xticks(work_df["year"]); st.pyplot(fig3)
     except Exception as e: st.error(f"Census Workforce Error: {e}")
