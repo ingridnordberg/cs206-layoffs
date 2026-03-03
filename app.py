@@ -35,7 +35,13 @@ if 'outlets_cache' not in st.session_state:
 if 'current_results' not in st.session_state:
     st.session_state.current_results = []
 
-# --- COUNTY FIPS LOADER ---
+# --- HELPERS ---
+def is_valid_loc(loc):
+    """Checks if a location string is usable/valid."""
+    if pd.isna(loc) or str(loc).lower().strip() in ['nan', 'unknown', 'n/a', '']:
+        return False
+    return True
+
 @st.cache_data
 def load_county_fips(path="county_fips.csv"):
     m = {}
@@ -50,24 +56,63 @@ def load_county_fips(path="county_fips.csv"):
     return m
 
 # --- SERIES BUILDERS ---
-def laus_series(area_code, measurement_code="03"):
-    return f"LAU{area_code}{measurement_code}"
+def laus_state_series(state_abbr, seasonal="S"):
+    fips = STATE_ABBR_TO_FIPS[state_abbr]
+    area = f"ST{fips}{'0'*11}"
+    return f"LA{seasonal}{area}03"
 
-def get_area_code(state_abbr, county_fips=None):
-    """
-    Returns the 15-character LAUS Area Code.
-    For broader 'City/Metro' area, we prioritize Metropolitan (MT) or County (CN).
-    """
-    if county_fips:
-        # CN + 5-digit FIPS + 000000000 (standard county area)
-        return f"CN{county_fips}00000000"
-    fips = STATE_ABBR_TO_FIPS.get(state_abbr, "06")
-    return f"ST{fips}00000000000"
+def laus_county_series(county_fips5):
+    area = f"CN{county_fips5}{'0'*8}"
+    return f"LAU{area}03"
 
 # --- LOGIC FUNCTIONS ---
+def generate_narrative(company_row, full_df, bls_df):
+    company = company_row['company']
+    location = company_row['location']
+    jobs = company_row['jobs']
+    date = company_row['notice_date']
+    state = company_row['postal_code']
+    
+    loc_display = location if is_valid_loc(location) else f"the state of {state}"
+    
+    # 1. CONTEXT: BLS Trends
+    bls_text = "Local economic trend data is currently unavailable."
+    if bls_df is not None and not bls_df.empty:
+        latest_rate = bls_df.iloc[-1]['value']
+        old_idx = -6 if len(bls_df) >= 6 else 0
+        old_rate = bls_df.iloc[old_idx]['value']
+        trend = "increased" if latest_rate > old_rate else "decreased" if latest_rate < old_rate else "stagnated"
+        bls_text = f"Over the past 6 months, unemployment in this region has {trend}, moving from {old_rate}% to {latest_rate}%."
+
+    # 2. RECURRING ACTIVITY (Only if location is valid)
+    recurring_text = ""
+    if is_valid_loc(location):
+        ninety_days_ago = date - pd.Timedelta(days=90)
+        recent_warns = full_df[
+            (full_df['location'] == location) & 
+            (full_df['notice_date'] >= ninety_days_ago) &
+            (full_df['notice_date'] <= date)
+        ]
+        count_90 = len(recent_warns)
+        total_90 = recent_warns['jobs'].sum()
+        recurring_text = f"\n\n**Recurring Activity:** This is the **{count_90}th** WARN notice filed in **{location}** in the past 90 days, totaling **{int(total_90) if not pd.isna(total_90) else 'Unknown'}** layoffs in this immediate area."
+    else:
+        # Fallback: State-wide context if county is missing
+        state_warns = full_df[
+            (full_df['postal_code'] == state) & 
+            (full_df['notice_date'] >= (date - pd.Timedelta(days=30)))
+        ]
+        recurring_text = f"\n\n**Regional Context:** In the last 30 days, there have been {len(state_warns)} total WARN filings across {state}."
+
+    # 3. ASSEMBLY
+    job_str = f"{int(jobs)}" if not pd.isna(jobs) else "an unspecified number of"
+    narrative = f"**Context:** In {date.strftime('%B %Y')}, **{company}** announced **{job_str}** layoffs in **{loc_display}**. {bls_text}{recurring_text}"
+    return narrative
+
 def find_company_website(company, location, api_key):
     clean_name = re.sub(r'[^a-zA-Z0-9]', '', company).lower()
-    query = f'"{company}" official corporate homepage'
+    loc_query = location if is_valid_loc(location) else ""
+    query = f'"{company}" {loc_query} official corporate homepage'
     url = "https://google.serper.dev/search"
     payload = json.dumps({"q": query, "num": 10})
     headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
@@ -100,8 +145,9 @@ def guess_industry(company_name):
     return "General Business"
 
 def run_investigation(row, api_key):
-    company, location = row['company'], row['location']
-    st.session_state.website_cache[company] = find_company_website(company, location, api_key)
+    company = row['company']
+    location = row['location'] if is_valid_loc(row['location']) else row['postal_code']
+    st.session_state.website_cache[company] = find_company_website(company, row['location'], api_key)
     query = f'"{company}" layoffs {location} -site:.gov'
     r = requests.post("https://google.serper.dev/news", headers={'X-API-KEY': api_key}, json={"q": query})
     hits = r.json().get('news', [])
@@ -116,16 +162,11 @@ def run_investigation(row, api_key):
 
 # --- BLS FETCH & PARSE ---
 def bls_fetch(series_ids, startyear, endyear, api_key=FRIEND_API_KEY):
-    payload = {
-        "seriesid": series_ids,
-        "startyear": str(startyear),
-        "endyear": str(endyear),
-        "registrationKey": api_key,
-    }
+    payload = {"seriesid": series_ids, "startyear": str(startyear), "endyear": str(endyear), "registrationKey": api_key}
     r = requests.post(BLS_URL, json=payload, timeout=25)
     return r.json()
 
-def parse_bls_to_df(resp_json):
+def parse_monthly_to_df(resp_json):
     out = []
     for series in resp_json.get("Results", {}).get("series", []):
         sid = series["seriesID"]
@@ -141,21 +182,28 @@ def parse_bls_to_df(resp_json):
         df = df.sort_values('date')
     return df
 
+def fmt_val(x, suffix=""):
+    return "N/A" if x is None or pd.isna(x) else f"{x:.2f}{suffix}"
+
 # --- UI MAIN ---
 st.title("🕵️‍♂️ Enriched WARN Investigator")
-
-st.warning("**Transparency Disclaimer:** WARN filings vary by state. City-level data covers the broader metropolitan area where available.")
-
 uploaded_file = st.file_uploader("Upload integrated.csv", type="csv")
+
+bls_df = pd.DataFrame() 
 
 if uploaded_file:
     df_raw = pd.read_csv(uploaded_file)
     df_raw.columns = df_raw.columns.str.strip().str.lower()
     
-    df_active = df_raw[df_raw['is_superseded'] == False].copy() if 'is_superseded' in df_raw.columns else df_raw.copy()
+    if 'is_superseded' in df_raw.columns:
+        df_active = df_raw[df_raw['is_superseded'] == False].copy()
+    else:
+        df_active = df_raw.copy()
+
     df_active['notice_date'] = pd.to_datetime(df_active['notice_date'], errors='coerce')
     df_active['industry'] = df_active['company'].apply(guess_industry)
     
+    # FILTERS
     st.sidebar.header("Investigation Filters")
     unique_states = sorted(df_active['postal_code'].dropna().unique())
     selected_states = st.sidebar.multiselect("Select States:", unique_states, default=unique_states[:1])
@@ -172,16 +220,37 @@ if uploaded_file:
     filtered_df = filtered_df[(filtered_df['notice_date'] >= pd.Timestamp(date_range[0])) & (filtered_df['notice_date'] <= pd.Timestamp(date_range[1]))]
     if search_query: filtered_df = filtered_df[filtered_df['company'].str.contains(search_query, case=False, na=False)]
 
+    # SPREADSHEET
     st.subheader(f"📊 Filtered Layoff Records ({len(filtered_df)} entries)")
     st.dataframe(filtered_df[['notice_date', 'company', 'industry', 'location', 'jobs']], use_container_width=True)
 
+    # INVESTIGATION SEARCH
     st.divider()
+    st.header("🔍 Company Investigation & Narrative")
     col1, col2 = st.columns([1, 2])
     with col1:
         to_investigate = st.selectbox("Investigate a Company:", sorted(filtered_df['company'].dropna().unique()))
+        
+        if to_investigate:
+            selected_row = filtered_df[filtered_df['company'] == to_investigate].iloc[0]
+            
+            # Clean location for display
+            display_loc = selected_row['location'] if is_valid_loc(selected_row['location']) else "Unknown Location"
+            st.write(f"📍 **Location:** {display_loc}")
+            
+            if bls_df.empty:
+                try:
+                    state_code = selected_row['postal_code']
+                    temp_series = laus_state_series(state_code)
+                    resp = bls_fetch([temp_series], dt.date.today().year - 1, dt.date.today().year)
+                    bls_df = parse_monthly_to_df(resp)
+                except: pass
+            
+            story = generate_narrative(selected_row, df_active, bls_df)
+            st.info(story)
+
         if st.button("🚀 Run Agentic Search"):
             api_key = "57bb99cacfc8c06c15a4a046b909c95a6dd06248"
-            selected_row = filtered_df[filtered_df['company'] == to_investigate].iloc[0]
             st.session_state.current_results = run_investigation(selected_row, api_key)
             st.rerun()
 
@@ -189,71 +258,63 @@ if uploaded_file:
         if to_investigate in st.session_state.website_cache:
             site = st.session_state.website_cache[to_investigate]
             if site: st.info(f"🌐 **Official Website:** [{site}]({site})")
+            outlets = st.session_state.outlets_cache.get(to_investigate, "")
+            if outlets and outlets != "No news found": st.success(f"### Reported by: {outlets}")
             if 'current_results' in st.session_state:
                 for res in st.session_state.current_results:
                     with st.expander(f"{res['score']}% Match - {res['title']}"):
                         st.write(f"[Read Article]({res['link']})")
 
+    # TRENDS & BLS
     st.divider()
-    st.header("📉 Impact Analysis & Context (City/Area Level)")
-    
+    st.subheader("📈 Layoff Frequency (Filtered View)")
+    chart_data = filtered_df.dropna(subset=['notice_date', 'jobs'])
+    if not chart_data.empty:
+        monthly_trend = chart_data.set_index('notice_date').resample('MS')['jobs'].sum().reset_index()
+        st.bar_chart(data=monthly_trend, x='notice_date', y='jobs', color="#ff4b4b")
+
+    st.divider()
+    st.header("📉 Macroeconomic Context (BLS Data)")
     bls_state = selected_states[0] if selected_states else "CA"
     county_map = load_county_fips()
+    colA, colB = st.columns(2)
+    with colA:
+        view_type = st.radio("View BLS data by:", ["State", "County"], horizontal=True)
+    with colB:
+        if view_type == "County":
+            if county_map:
+                available_counties = [k[1] for k in county_map.keys() if k[0] == bls_state]
+                sel_county = st.selectbox("Select County:", sorted(available_counties))
+            else:
+                st.error("⚠️ `county_fips.csv` not found.")
+                view_type = "State"
     
-    selected_row = filtered_df[filtered_df['company'] == to_investigate].iloc[0]
-    comp_area = selected_row.get('location', 'Unknown') # Now treating this as the whole city/area
-    comp_jobs = selected_row.get('jobs', 0)
-    
-    area_code = get_area_code(bls_state)
-    if county_map and (bls_state, comp_area) in county_map:
-        fips = county_map[(bls_state, comp_area)]
-        area_code = get_area_code(bls_state, fips)
-
-    rate_sid = laus_series(area_code, "03")
-    emp_sid = laus_series(area_code, "05")
+    if view_type == "County" and county_map:
+        fips = county_map[(bls_state, sel_county)]
+        series_id = laus_county_series(fips)
+        label = f"Unemployment Rate (%) — {sel_county}, {bls_state}"
+    else:
+        series_id = laus_state_series(bls_state)
+        label = f"Unemployment Rate (%) — {bls_state}"
 
     try:
         current_year = dt.date.today().year
-        resp = bls_fetch([rate_sid, emp_sid], current_year - 2, current_year)
-        bls_df = parse_bls_to_df(resp)
-
+        resp = bls_fetch([series_id], current_year - 5, current_year)
+        bls_df = parse_monthly_to_df(resp)
         if not bls_df.empty:
-            df_rate = bls_df[bls_df['seriesID'] == rate_sid]
-            df_emp = bls_df[bls_df['seriesID'] == emp_sid]
-
-            latest_rate = df_rate.iloc[-1]['value'] if not df_rate.empty else 0
-            latest_emp = df_emp.iloc[-1]['value'] if not df_emp.empty else 1
-            
-            target_date = df_rate.iloc[-1]['date'] - pd.DateOffset(years=1)
-            prev_rate_row = df_rate[df_rate['date'] == target_date]
-            old_rate = prev_rate_row.iloc[0]['value'] if not prev_rate_row.empty else latest_rate
-
-            impact_pct = (comp_jobs / latest_emp) * 100
-            trend = "increased" if latest_rate > old_rate else "decreased" if latest_rate < old_rate else "stagnated"
-
-            st.subheader(f"Analysis for {to_investigate} in {comp_area} Area")
-            
-            c1, c2 = st.columns(2)
-            with c1:
-                st.metric(f"Total {comp_area} Employment", f"{int(latest_emp):,}")
-                st.write(f"The layoffs account for approximately **{impact_pct:.4f}%** of the **entire area's** employment.")
-            with c2:
-                st.metric("Area Trend", f"{latest_rate}% Rate")
-                st.write(f"Unemployment in the **{comp_area} area** has **{trend}** from {old_rate}% year-over-year.")
-
-            # Visualization with requested clear axis labels
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(df_rate['date'], df_rate['value'], marker='o', color='#E63946', linewidth=2)
-            ax.set_title(f"Unemployment Rate: Entire {comp_area} Area", fontsize=14)
-            ax.set_xlabel("Timeline (Month/Year)", fontsize=12)
-            ax.set_ylabel("Unemployment Rate (%)", fontsize=12)
-            ax.grid(True, linestyle='--', alpha=0.7)
-            plt.xticks(rotation=45)
+            latest_row = bls_df.iloc[-1]
+            cur_val = latest_row['value']
+            target_date = latest_row['date'] - pd.DateOffset(years=1)
+            prev_row = bls_df[bls_df['date'] == target_date]
+            yoy_val = cur_val - prev_row.iloc[0]['value'] if not prev_row.empty else None
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Latest Rate", f"{fmt_val(cur_val)}%")
+            m2.metric("YoY Change", fmt_val(yoy_val, " pp"))
+            m3.metric("Series ID", series_id)
+            fig, ax = plt.subplots(figsize=(10, 3))
+            ax.plot(bls_df["date"], bls_df["value"], color="#1f77b4", linewidth=2)
+            ax.set_title(label)
+            ax.grid(True, alpha=0.3)
             st.pyplot(fig)
-            
-        else:
-            st.warning(f"Could not aggregate data for the entire city of {comp_area}. Please check FIPS mapping.")
     except Exception as e:
         st.error(f"BLS Fetch Error: {e}")
-
-st.caption("Data sources: BLS Public API v2 (LAUS), Serper News.")
