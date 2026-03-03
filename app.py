@@ -24,7 +24,7 @@ STATE_ABBR_TO_FIPS = {
     "FL":"12","GA":"13","HI":"15","ID":"16","IL":"17","IN":"18","IA":"19","KS":"20","KY":"21",
     "LA":"22","ME":"23","MD":"24","MA":"25","MI":"26","MN":"27","MS":"28","MO":"29","MT":"30",
     "NE":"31","NV":"32","NH":"33","NJ":"34","NM":"35","NY":"36","NC":"37","ND":"38","OH":"39",
-    "OK":"40","OR":"41","PA":"42","RI":"44","SC":"45","SD":"46","TN":"47","TX":"48","UT":"49",
+    "OK":"40","OR":"41","PA":"42","RI":"44","SC":"45","SD":"46","TN":"47","TX":"48","TX":"48","UT":"49",
     "VT":"50","VA":"51","WA":"53","WV":"54","WI":"55","WY":"56","PR":"72"
 }
 
@@ -290,22 +290,19 @@ if uploaded_file:
 
     series_id = laus_county_series(curr_county_fips) if view_type == "County" and curr_county_fips else laus_state_series(bls_state)
     try:
-        bls_df = parse_monthly_to_df(bls_fetch([series_id], dt.date.today().year - 5, dt.date.today().year))
-        if not bls_df.empty:
+        bls_fetch_df = parse_monthly_to_df(bls_fetch([series_id], dt.date.today().year - 5, dt.date.today().year))
+        if not bls_fetch_df.empty:
             m1, m2, m3 = st.columns(3)
-            m1.metric("Latest Unemployment", f"{fmt_val(bls_df.iloc[-1]['value'])}%")
+            m1.metric("Latest Unemployment", f"{fmt_val(bls_fetch_df.iloc[-1]['value'])}%")
             m3.metric("BLS Series ID", series_id)
             fig, ax = plt.subplots(figsize=(10, 3))
             
             fig.patch.set_facecolor(app_background_color)
             ax.set_facecolor(app_background_color)
-            ax.bar(bls_df["date"], bls_df["value"], color="#1f77b4", width=20) 
+            ax.bar(bls_fetch_df["date"], bls_fetch_df["value"], color="#1f77b4", width=20) 
             ax.set_title(f"Unemployment Rate (%) — {sel_county if view_type == 'County' else bls_state}", color=text_color)
-            
-            # --- Added Labels ---
             ax.set_xlabel("Notice Month", color=text_color)
             ax.set_ylabel("Unemployment Rate (%)", color=text_color)
-            
             ax.tick_params(axis='x', colors=text_color)
             ax.tick_params(axis='y', colors=text_color)
             ax.grid(True, alpha=0.3, color=grid_color)
@@ -319,21 +316,31 @@ if uploaded_file:
         pop_df = fetch_census_population_trend(view_type, bls_state, curr_county_fips)
         if not pop_df.empty:
             st.metric("Latest Population", f"{pop_df.iloc[-1]['population']:,}")
-            fig2, ax2 = plt.subplots(figsize=(10, 3))
+            fig2, ax2 = plt.subplots(figsize=(10, 4))
             
             fig2.patch.set_facecolor(app_background_color)
             ax2.set_facecolor(app_background_color)
-            ax2.bar(pop_df["year"], pop_df["population"], color="#2ca02c")
-            ax2.set_title("Total Population Trend (ACS 5-year)", color=text_color)
             
-            # --- Added Labels ---
+            ax2.plot(pop_df["year"], pop_df["population"], color="#2ca02c", marker='o', markersize=8, linewidth=2, linestyle='-')
+            
+            for i, row in pop_df.iterrows():
+                ax2.text(row["year"], row["population"], f'{int(row["population"]):,}', 
+                         color=text_color, ha='center', va='bottom', fontsize=9, fontweight='bold', 
+                         bbox=dict(facecolor=app_background_color, alpha=0.6, edgecolor='none', pad=1))
+            
+            ax2.set_title("Total Population Trend (ACS 5-year)", color=text_color)
             ax2.set_xlabel("Year", color=text_color)
             ax2.set_ylabel("Total Population", color=text_color)
-            
             ax2.tick_params(axis='x', colors=text_color)
             ax2.tick_params(axis='y', colors=text_color)
             ax2.grid(True, alpha=0.3, color=grid_color)
             ax2.set_xticks(pop_df["year"])
+            
+            # --- FIX: Dynamically set Y-axis to center the line ---
+            ymin, ymax = pop_df["population"].min(), pop_df["population"].max()
+            padding = (ymax - ymin) * 0.5 if ymax != ymin else ymin * 0.05
+            ax2.set_ylim(ymin - padding, ymax + padding)
+            
             plt.tight_layout()
             st.pyplot(fig2)
     except Exception as e: st.error(f"Census Pop Error: {e}")
@@ -344,21 +351,31 @@ if uploaded_file:
         work_df = fetch_census_workforce_trend(view_type, bls_state, curr_county_fips)
         if not work_df.empty:
             st.metric("Latest Labor Force Size", f"{work_df.iloc[-1]['workforce']:,}")
-            fig3, ax3 = plt.subplots(figsize=(10, 3))
+            fig3, ax3 = plt.subplots(figsize=(10, 4))
             
             fig3.patch.set_facecolor(app_background_color)
             ax3.set_facecolor(app_background_color)
-            ax3.bar(work_df["year"], work_df["workforce"], color="#9467bd")
-            ax3.set_title("Total Labor Force Trend (ACS 5-year)", color=text_color)
             
-            # --- Added Labels ---
+            ax3.plot(work_df["year"], work_df["workforce"], color="#9467bd", marker='o', markersize=8, linewidth=2, linestyle='-')
+            
+            for i, row in work_df.iterrows():
+                ax3.text(row["year"], row["workforce"], f'{int(row["workforce"]):,}', 
+                         color=text_color, ha='center', va='bottom', fontsize=9, fontweight='bold',
+                         bbox=dict(facecolor=app_background_color, alpha=0.6, edgecolor='none', pad=1))
+            
+            ax3.set_title("Total Labor Force Trend (ACS 5-year)", color=text_color)
             ax3.set_xlabel("Year", color=text_color)
             ax3.set_ylabel("Labor Force Count", color=text_color)
-            
             ax3.tick_params(axis='x', colors=text_color)
             ax3.tick_params(axis='y', colors=text_color)
             ax3.grid(True, alpha=0.3, color=grid_color)
             ax3.set_xticks(work_df["year"])
+            
+            # --- FIX: Dynamically set Y-axis to center the line ---
+            ymin, ymax = work_df["workforce"].min(), work_df["workforce"].max()
+            padding = (ymax - ymin) * 0.5 if ymax != ymin else ymin * 0.05
+            ax3.set_ylim(ymin - padding, ymax + padding)
+            
             plt.tight_layout()
             st.pyplot(fig3)
     except Exception as e: st.error(f"Census Workforce Error: {e}")
