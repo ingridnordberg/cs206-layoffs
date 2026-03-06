@@ -363,9 +363,10 @@ if uploaded_file:
     try:
         bls_fetch_df = parse_monthly_to_df(bls_fetch([series_id], dt.date.today().year - 5, dt.date.today().year))
         if not bls_fetch_df.empty:
-            m1, m2, m3 = st.columns(3)
+            st.markdown("### 📊 Unemployment Rate (Labor Force Statistics)")
+            st.caption("Source: [U.S. Bureau of Labor Statistics (BLS)](https://www.bls.gov/lau/)")
+            m1, m2 = st.columns(2)
             m1.metric("Latest Unemployment", f"{fmt_val(bls_fetch_df.iloc[-1]['value'])}%")
-            m3.metric("BLS Series ID", series_id)
             fig, ax = plt.subplots(figsize=(10, 3))
             fig.patch.set_facecolor(app_background_color); ax.set_facecolor(app_background_color)
             ax.bar(bls_fetch_df["date"], bls_fetch_df["value"], color="#1f77b4", width=20) 
@@ -377,6 +378,7 @@ if uploaded_file:
 
     st.divider()
     st.subheader(f"👥 Population Context — {sel_county if view_type == 'County' else bls_state}")
+    st.caption("Source: [U.S. Census Bureau - ACS 5-Year Estimates](https://www.census.gov/data.html)")
     try:
         pop_df = fetch_census_population_trend(view_type, bls_state, curr_county_fips)
         if not pop_df.empty:
@@ -397,6 +399,7 @@ if uploaded_file:
 
     st.divider()
     st.subheader(f"💼 Total Workforce Size — {sel_county if view_type == 'County' else bls_state}")
+    st.caption("Source: [U.S. Census Bureau - Economic Characteristics](https://www.census.gov/data.html)")
     try:
         work_df = fetch_census_workforce_trend(view_type, bls_state, curr_county_fips)
         if not work_df.empty:
