@@ -420,24 +420,6 @@ if uploaded_file:
                 with st.expander(f"{res['title']}"):
                     st.write(f"[Read Article]({res['link']})")
 
-    # with col2:
-    #     if st.button("🚀 Run Agentic Search", help="Search the web and show relevant source links."):
-    #         api_key = "57bb99cacfc8c06c15a4a046b909c95a6dd06248"
-    #         with st.spinner("Searching..."):
-    #             st.session_state.current_results = run_investigation(selected_row, api_key)
-    #         st.rerun()
-    #     st.caption("When you run Agentic Search, the tool the tool searches the web for recent news coverage about the selected company/layoff and shows you links to the original sources.\n\n")
-    #     if to_investigate in st.session_state.website_cache:
-    #         outlets = st.session_state.outlets_cache.get(to_investigate, "")
-    #         if outlets == "No news found":
-    #             st.warning("No matching layoff/WARN news found for this query.")
-    #         else:
-    #             st.success(f"### Reported by: {outlets}")
-    #         if 'current_results' in st.session_state:
-    #             for res in st.session_state.current_results:
-    #                 with st.expander(f"{res['score']}% Match - {res['title']}"):
-    #                     st.write(f"[Read Article]({res['link']})")
-
     st.divider()
     st.subheader("📈 Layoff Frequency (Filtered View)")
     chart_data = filtered_df.dropna(subset=['notice_date', 'jobs'])
