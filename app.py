@@ -24,7 +24,7 @@ STATE_ABBR_TO_FIPS = {
     "FL":"12","GA":"13","HI":"15","ID":"16","IL":"17","IN":"18","IA":"19","KS":"20","KY":"21",
     "LA":"22","ME":"23","MD":"24","MA":"25","MI":"26","MN":"27","MS":"28","MO":"29","MT":"30",
     "NE":"31","NV":"32","NH":"33","NJ":"34","NM":"35","NY":"36","NC":"37","ND":"38","OH":"39",
-    "OK":"40","OR":"41","PA":"42","RI":"44","SC":"45","SD":"46","TN":"47","TX":"48","TX":"48","UT":"49",
+    "OK":"40","OR":"41","PA":"42","RI":"44","SC":"45","SD":"46","TN":"47","TX":"48","UT":"49",
     "VT":"50","VA":"51","WA":"53","WV":"54","WI":"55","WY":"56","PR":"72"
 }
 
@@ -70,29 +70,14 @@ def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 def looks_like_full_address(loc: str) -> bool:
-    # If there's a street number, it's probably an address; don't use it in the query.
     return bool(re.search(r"\b\d{1,6}\b", loc or ""))
 
 def clean_location_for_query(loc: str, state: str) -> str:
-    """
-    Convert messy location strings into something search-friendly.
-    - If missing/invalid -> state
-    - If full address -> state
-    - Else keep a short location (first chunk) + state
-    """
     if not is_valid_loc(loc):
         return state
-
     loc = str(loc).strip()
-
-    # Drop super-long multi-part locations (often lists of cities)
-    if len(loc) > 60:
+    if len(loc) > 60 or looks_like_full_address(loc):
         return state
-
-    if looks_like_full_address(loc):
-        return state
-
-    # If it already contains the state abbrev or a comma, keep it, else append state
     if re.search(r"\b[A-Z]{2}\b", loc) or "," in loc:
         return loc
     return f"{loc}, {state}"
@@ -105,15 +90,8 @@ LAYOFF_KEYWORDS = [
 ]
 
 BAD_DOMAINS = [
-    "linkedin.com",
-    "repvue.com",
-    "glassdoor.com",
-    "indeed.com",
-    "facebook.com",
-    "twitter.com",
-    "x.com",
-    "instagram.com",
-    "youtube.com",
+    "linkedin.com", "repvue.com", "glassdoor.com", "indeed.com",
+    "facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com",
 ]
 
 def contains_layoff_signal(title: str, snippet: str) -> bool:
@@ -224,105 +202,52 @@ def guess_industry(company_name):
         if any(word in name for word in keywords): return industry
     return "General Business"
 
-
-# --- NEW INVESTIGATION VIBE ---
 def run_investigation(row, api_key):
     company = row["company"]
     state = (row.get("postal_code") or "").strip().upper()
     raw_loc = row.get("location")
 
-    # Website search (same as before)
-    # st.session_state.website_cache[company] = find_company_website(company, raw_loc, api_key)
-    st.session_state.website_cache[company] = find_company_website(
-        company,
-        row['location'],   
-        api_key
-    )
+    st.session_state.website_cache[company] = find_company_website(company, raw_loc, api_key)
 
-    # Build a safer query (avoid over-specific addresses)
     loc_for_query = clean_location_for_query(raw_loc, state)
-    query = f'"{company}" ({ "layoffs OR \"job cuts\" OR \"WARN notice\"" }) {loc_for_query} -site:.gov'
+    
+    # FIX: Moved the problematic string out of the f-string curly braces
+    layoff_terms = 'layoffs OR "job cuts" OR "WARN notice"'
+    query = f'"{company}" ({layoff_terms}) {loc_for_query} -site:.gov'
 
     r = requests.post(
         "https://google.serper.dev/news",
         headers={"X-API-KEY": api_key},
-        json={"q": query, "num": 20},   # <--- BIG: request more than 5
+        json={"q": query, "num": 20},
         timeout=20
     )
-
     hits = r.json().get("news", []) or []
-
-    # Score + filter
     scored_results = []
     outlets = set()
 
     for hit in hits:
-        title = hit.get("title", "") or ""
-        snippet = hit.get("snippet", "") or ""
-        link = hit.get("link", "") or ""
-        source = hit.get("source", "Unknown")
-
-        if not link or domain_is_bad(link):
-            continue
-
-        # Company name match (keep your fuzz logic, but more forgiving)
+        title, snippet, link, source = hit.get("title", ""), hit.get("snippet", ""), hit.get("link", ""), hit.get("source", "Unknown")
+        if not link or domain_is_bad(link): continue
         score = fuzz.partial_ratio(company.lower(), title.lower())
-
-        # Topic gate: must look like layoffs/WARN somewhere in title/snippet
-        # Allow very high company-match scores to pass even if keyword is missing
-        topic_ok = contains_layoff_signal(title, snippet)
-        if not topic_ok and score < 90:
-            continue
-
-        if score >= 55:  # slightly looser than 60 to reduce “nothing found”
+        if not contains_layoff_signal(title, snippet) and score < 90: continue
+        if score >= 55:
             outlets.add(source)
-            scored_results.append({
-                "source": source,
-                "title": title,
-                "link": link,
-                "score": score,
-            })
+            scored_results.append({"source": source, "title": title, "link": link, "score": score})
+        if len(scored_results) >= 8: break
 
-        # keep it tight
-        if len(scored_results) >= 8:
-            break
-
-    # If we found nothing, fall back to a broader query (no location)
     if not scored_results:
         fallback_query = f'"{company}" (layoffs OR "job cuts" OR "WARN notice") -site:.gov'
-        r2 = requests.post(
-            "https://google.serper.dev/news",
-            headers={"X-API-KEY": api_key},
-            json={"q": fallback_query, "num": 20},
-            timeout=20
-        )
+        r2 = requests.post("https://google.serper.dev/news", headers={"X-API-KEY": api_key}, json={"q": fallback_query, "num": 20}, timeout=20)
         hits2 = r2.json().get("news", []) or []
-
         for hit in hits2:
-            title = hit.get("title", "") or ""
-            snippet = hit.get("snippet", "") or ""
-            link = hit.get("link", "") or ""
-            source = hit.get("source", "Unknown")
-
-            if not link or domain_is_bad(link):
-                continue
-
+            title, snippet, link, source = hit.get("title", ""), hit.get("snippet", ""), hit.get("link", ""), hit.get("source", "Unknown")
+            if not link or domain_is_bad(link): continue
             score = fuzz.partial_ratio(company.lower(), title.lower())
-            topic_ok = contains_layoff_signal(title, snippet)
-            if not topic_ok and score < 90:
-                continue
-
+            if not contains_layoff_signal(title, snippet) and score < 90: continue
             if score >= 55:
                 outlets.add(source)
-                scored_results.append({
-                    "source": source,
-                    "title": title,
-                    "link": link,
-                    "score": score,
-                })
-
-            if len(scored_results) >= 8:
-                break
+                scored_results.append({"source": source, "title": title, "link": link, "score": score})
+            if len(scored_results) >= 8: break
 
     st.session_state.outlets_cache[company] = ", ".join(sorted(outlets)) if outlets else "No news found"
     return scored_results
@@ -399,44 +324,18 @@ if uploaded_file:
                 st.session_state.current_results = run_investigation(selected_row, api_key)
             st.rerun()
 
-        # Show caption ONLY before search has run
         if not st.session_state.get("current_results"):
-            st.caption(
-                "When you run Agentic Search, the tool searches the web for recent "
-                "news coverage about the selected company/layoff and shows you links "
-                "to the original sources."
-            )
+            st.caption("When you run Agentic Search, the tool searches the web for recent news coverage about the selected company/layoff.")
 
-        # Show results after search
         if st.session_state.get("current_results") is not None:
             outlets = st.session_state.outlets_cache.get(to_investigate, "")
-
             if outlets == "No news found":
                 st.warning("No matching layoff/WARN news found for this query.")
             elif outlets:
                 st.success(f"### Reported by: {outlets}")
-
             for res in st.session_state.current_results:
                 with st.expander(f"{res['title']}"):
                     st.write(f"[Read Article]({res['link']})")
-
-    # with col2:
-    #     if st.button("🚀 Run Agentic Search", help="Search the web and show relevant source links."):
-    #         api_key = "57bb99cacfc8c06c15a4a046b909c95a6dd06248"
-    #         with st.spinner("Searching..."):
-    #             st.session_state.current_results = run_investigation(selected_row, api_key)
-    #         st.rerun()
-    #     st.caption("When you run Agentic Search, the tool the tool searches the web for recent news coverage about the selected company/layoff and shows you links to the original sources.\n\n")
-    #     if to_investigate in st.session_state.website_cache:
-    #         outlets = st.session_state.outlets_cache.get(to_investigate, "")
-    #         if outlets == "No news found":
-    #             st.warning("No matching layoff/WARN news found for this query.")
-    #         else:
-    #             st.success(f"### Reported by: {outlets}")
-    #         if 'current_results' in st.session_state:
-    #             for res in st.session_state.current_results:
-    #                 with st.expander(f"{res['score']}% Match - {res['title']}"):
-    #                     st.write(f"[Read Article]({res['link']})")
 
     st.divider()
     st.subheader("📈 Layoff Frequency (Filtered View)")
@@ -458,10 +357,7 @@ if uploaded_file:
             curr_county_fips = county_map[(bls_state, sel_county)]
         elif view_type == "County": st.error("⚠️ `county_fips.csv` not found."); view_type = "State"
 
-    # Define common dark theme parameters
-    app_background_color = "#0e1117"
-    text_color = "#fafafa"
-    grid_color = "#444444"
+    app_background_color, text_color, grid_color = "#0e1117", "#fafafa", "#444444"
 
     series_id = laus_county_series(curr_county_fips) if view_type == "County" and curr_county_fips else laus_state_series(bls_state)
     try:
@@ -471,18 +367,12 @@ if uploaded_file:
             m1.metric("Latest Unemployment", f"{fmt_val(bls_fetch_df.iloc[-1]['value'])}%")
             m3.metric("BLS Series ID", series_id)
             fig, ax = plt.subplots(figsize=(10, 3))
-            
-            fig.patch.set_facecolor(app_background_color)
-            ax.set_facecolor(app_background_color)
+            fig.patch.set_facecolor(app_background_color); ax.set_facecolor(app_background_color)
             ax.bar(bls_fetch_df["date"], bls_fetch_df["value"], color="#1f77b4", width=20) 
             ax.set_title(f"Unemployment Rate (%) — {sel_county if view_type == 'County' else bls_state}", color=text_color)
-            ax.set_xlabel("Notice Month", color=text_color)
-            ax.set_ylabel("Unemployment Rate (%)", color=text_color)
-            ax.tick_params(axis='x', colors=text_color)
-            ax.tick_params(axis='y', colors=text_color)
-            ax.grid(True, alpha=0.3, color=grid_color)
-            plt.tight_layout()
-            st.pyplot(fig)
+            ax.set_xlabel("Notice Month", color=text_color); ax.set_ylabel("Unemployment Rate (%)", color=text_color)
+            ax.tick_params(axis='x', colors=text_color); ax.tick_params(axis='y', colors=text_color)
+            ax.grid(True, alpha=0.3, color=grid_color); plt.tight_layout(); st.pyplot(fig)
     except Exception as e: st.error(f"BLS Error: {e}")
 
     st.divider()
@@ -492,32 +382,17 @@ if uploaded_file:
         if not pop_df.empty:
             st.metric("Latest Population", f"{pop_df.iloc[-1]['population']:,}")
             fig2, ax2 = plt.subplots(figsize=(10, 4))
-            
-            fig2.patch.set_facecolor(app_background_color)
-            ax2.set_facecolor(app_background_color)
-            
+            fig2.patch.set_facecolor(app_background_color); ax2.set_facecolor(app_background_color)
             ax2.plot(pop_df["year"], pop_df["population"], color="#2ca02c", marker='o', markersize=8, linewidth=2, linestyle='-')
-            
             for i, row in pop_df.iterrows():
-                ax2.text(row["year"], row["population"], f'{int(row["population"]):,}', 
-                         color=text_color, ha='center', va='bottom', fontsize=9, fontweight='bold', 
-                         bbox=dict(facecolor=app_background_color, alpha=0.6, edgecolor='none', pad=1))
-            
+                ax2.text(row["year"], row["population"], f'{int(row["population"]):,}', color=text_color, ha='center', va='bottom', fontsize=9, fontweight='bold', bbox=dict(facecolor=app_background_color, alpha=0.6, edgecolor='none', pad=1))
             ax2.set_title("Total Population Trend (ACS 5-year)", color=text_color)
-            ax2.set_xlabel("Year", color=text_color)
-            ax2.set_ylabel("Total Population", color=text_color)
-            ax2.tick_params(axis='x', colors=text_color)
-            ax2.tick_params(axis='y', colors=text_color)
-            ax2.grid(True, alpha=0.3, color=grid_color)
-            ax2.set_xticks(pop_df["year"])
-            
-            # --- FIX: Dynamically set Y-axis to center the line ---
+            ax2.set_xlabel("Year", color=text_color); ax2.set_ylabel("Total Population", color=text_color)
+            ax2.tick_params(axis='x', colors=text_color); ax2.tick_params(axis='y', colors=text_color)
+            ax2.grid(True, alpha=0.3, color=grid_color); ax2.set_xticks(pop_df["year"])
             ymin, ymax = pop_df["population"].min(), pop_df["population"].max()
             padding = (ymax - ymin) * 0.5 if ymax != ymin else ymin * 0.05
-            ax2.set_ylim(ymin - padding, ymax + padding)
-            
-            plt.tight_layout()
-            st.pyplot(fig2)
+            ax2.set_ylim(ymin - padding, ymax + padding); plt.tight_layout(); st.pyplot(fig2)
     except Exception as e: st.error(f"Census Pop Error: {e}")
 
     st.divider()
@@ -527,30 +402,15 @@ if uploaded_file:
         if not work_df.empty:
             st.metric("Latest Labor Force Size", f"{work_df.iloc[-1]['workforce']:,}")
             fig3, ax3 = plt.subplots(figsize=(10, 4))
-            
-            fig3.patch.set_facecolor(app_background_color)
-            ax3.set_facecolor(app_background_color)
-            
+            fig3.patch.set_facecolor(app_background_color); ax3.set_facecolor(app_background_color)
             ax3.plot(work_df["year"], work_df["workforce"], color="#9467bd", marker='o', markersize=8, linewidth=2, linestyle='-')
-            
             for i, row in work_df.iterrows():
-                ax3.text(row["year"], row["workforce"], f'{int(row["workforce"]):,}', 
-                         color=text_color, ha='center', va='bottom', fontsize=9, fontweight='bold',
-                         bbox=dict(facecolor=app_background_color, alpha=0.6, edgecolor='none', pad=1))
-            
+                ax3.text(row["year"], row["workforce"], f'{int(row["workforce"]):,}', color=text_color, ha='center', va='bottom', fontsize=9, fontweight='bold', bbox=dict(facecolor=app_background_color, alpha=0.6, edgecolor='none', pad=1))
             ax3.set_title("Total Labor Force Trend (ACS 5-year)", color=text_color)
-            ax3.set_xlabel("Year", color=text_color)
-            ax3.set_ylabel("Labor Force Count", color=text_color)
-            ax3.tick_params(axis='x', colors=text_color)
-            ax3.tick_params(axis='y', colors=text_color)
-            ax3.grid(True, alpha=0.3, color=grid_color)
-            ax3.set_xticks(work_df["year"])
-            
-            # --- FIX: Dynamically set Y-axis to center the line ---
+            ax3.set_xlabel("Year", color=text_color); ax3.set_ylabel("Labor Force Count", color=text_color)
+            ax3.tick_params(axis='x', colors=text_color); ax3.tick_params(axis='y', colors=text_color)
+            ax3.grid(True, alpha=0.3, color=grid_color); ax3.set_xticks(work_df["year"])
             ymin, ymax = work_df["workforce"].min(), work_df["workforce"].max()
             padding = (ymax - ymin) * 0.5 if ymax != ymin else ymin * 0.05
-            ax3.set_ylim(ymin - padding, ymax + padding)
-            
-            plt.tight_layout()
-            st.pyplot(fig3)
+            ax3.set_ylim(ymin - padding, ymax + padding); plt.tight_layout(); st.pyplot(fig3)
     except Exception as e: st.error(f"Census Workforce Error: {e}")
