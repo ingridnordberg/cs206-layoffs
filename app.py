@@ -6,7 +6,7 @@ import json
 import re
 import csv
 import datetime as dt
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz
 import matplotlib.pyplot as plt
@@ -453,6 +453,16 @@ if uploaded_file:
 
             st.info(generate_narrative(selected_row, df_active, bls_df))
 
+            # --- NEW: LinkedIn Source Finder ---
+            st.markdown("---")
+            st.subheader("🕵️ Source Hunting")
+            # Build LinkedIn Search URL
+            safe_company = quote(f'"{selected_row["company"]}"')
+            safe_city = quote(f'"{selected_row["location"]}"') if is_valid_loc(selected_row["location"]) else ""
+            li_url = f"https://www.linkedin.com/search/results/people/?keywords={safe_company}%20%22open%20to%20work%22%20{safe_city}"
+            
+            st.link_button("🤝 Find Interview Subjects on LinkedIn", li_url, use_container_width=True, help="Search for people recently at this company who are 'Open to Work'.")
+    
     with col2:
         if st.button("Run Agentic Search ✨", help="Search the web and show relevant source links."):
             api_key = "57bb99cacfc8c06c15a4a046b909c95a6dd06248"
@@ -564,6 +574,7 @@ if uploaded_file:
 
     st.divider()
     st.subheader(f"Population Context — {sel_county if view_type == 'County' else bls_state}")
+    st.caption("Source: [U.S. Census Bureau - ACS 5-Year Estimates](https://www.census.gov/data.html)")
     if not pop_df.empty:
         st.metric("Latest Population", f"{pop_df.iloc[-1]['population']:,}")
 
@@ -601,6 +612,7 @@ if uploaded_file:
 
     st.divider()
     st.subheader(f"Total Workforce Size — {sel_county if view_type == 'County' else bls_state}")
+    st.caption("Source: [U.S. Census Bureau - Economic Characteristics](https://www.census.gov/data.html)")
     if not work_df.empty:
         st.metric("Latest Labor Force Size", f"{work_df.iloc[-1]['workforce']:,}")
 
