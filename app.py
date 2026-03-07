@@ -82,6 +82,53 @@ def clean_location_for_query(loc: str, state: str) -> str:
         return loc
     return f"{loc}, {state}"
 
+def generate_macro_madlib(view_type, state, county, bls_df, pop_df, work_df):
+    
+    # determine geography label
+    if view_type == "County" and county:
+        geography = f"{county}, {state}"
+    else:
+        geography = state
+
+    # unemployment
+    unemployment_text = "unemployment data is currently unavailable"
+    if bls_df is not None and not bls_df.empty:
+        latest = bls_df.iloc[-1]["value"]
+        old = bls_df.iloc[-6]["value"] if len(bls_df) >= 6 else bls_df.iloc[0]["value"]
+
+        if latest > old:
+            trend = "increased"
+        elif latest < old:
+            trend = "decreased"
+        else:
+            trend = "remained stable"
+
+        unemployment_text = f"the unemployment rate is **{latest:.1f}%**, which has **{trend}** over the past six months"
+
+    # population
+    population_text = "population data unavailable"
+    if pop_df is not None and not pop_df.empty:
+        population = pop_df.iloc[-1]["population"]
+        population_text = f"the region has a population of **{population:,}**"
+
+    # workforce
+    workforce_text = "labor force data unavailable"
+    if work_df is not None and not work_df.empty:
+        workforce = work_df.iloc[-1]["workforce"]
+        workforce_text = f"with roughly **{workforce:,}** people in the labor force"
+
+    return f"""
+**Regional Economic Snapshot**
+
+For **{geography}**, the available macroeconomic indicators suggest the following:
+
+• **Labor Market:** Currently, {unemployment_text}.  
+• **Population:** According to recent Census estimates, {population_text}.  
+• **Labor Force:** The region is estimated to have {workforce_text}.
+
+These indicators provide context for understanding broader labor market conditions in this area.
+"""
+
 LAYOFF_KEYWORDS = [
     "layoff", "layoffs", "job cut", "job cuts", "cut jobs",
     "reduction in force", "rif", "redundant", "redundancies",
@@ -345,6 +392,18 @@ if uploaded_file:
 
     st.divider()
     st.header("📉 Macroeconomic Context (BLS & Census Data)")
+    try:
+        madlib_text = generate_macro_madlib(
+            view_type,
+            bls_state,
+            sel_county if view_type == "County" else None,
+            bls_fetch_df if 'bls_fetch_df' in locals() else None,
+            pop_df if 'pop_df' in locals() else None,
+            work_df if 'work_df' in locals() else None
+        )
+        st.info(madlib_text)
+    except:
+        print("error...")
     bls_state = selected_states[0] if selected_states else "CA"
     county_map = load_county_fips()
     colA, colB = st.columns(2)
