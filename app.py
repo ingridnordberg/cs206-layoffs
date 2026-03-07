@@ -10,6 +10,7 @@ from urllib.parse import urlparse, quote
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz
 import matplotlib.pyplot as plt
+import altair as alt
 
 # --- CONFIG ---
 st.set_page_config(page_title="Enriched WARN & Economic Intelligence", page_icon="🕵️", layout="wide")
@@ -454,14 +455,14 @@ if uploaded_file:
             st.info(generate_narrative(selected_row, df_active, bls_df))
 
             # --- NEW: LinkedIn Source Finder ---
-            st.markdown("---")
-            st.subheader("🕵️ Source Hunting")
+            # st.markdown("---")
+            st.subheader("Source Hunting")
             # Build LinkedIn Search URL
             safe_company = quote(f'"{selected_row["company"]}"')
             safe_city = quote(f'"{selected_row["location"]}"') if is_valid_loc(selected_row["location"]) else ""
             li_url = f"https://www.linkedin.com/search/results/people/?keywords={safe_company}%20%22open%20to%20work%22%20{safe_city}"
             
-            st.link_button("🤝 Find Interview Subjects on LinkedIn", li_url, use_container_width=True, help="Search for people recently at this company who are 'Open to Work'.")
+            st.link_button("Find Interview Subjects on LinkedIn", li_url, use_container_width=True, help="Search for people recently at this company who are 'Open to Work'.")
     
     with col2:
         if st.button("Run Agentic Search ✨", help="Search the web and show relevant source links."):
@@ -554,26 +555,37 @@ if uploaded_file:
     )
     st.info(madlib_text)
 
-    if not bls_fetch_df.empty:
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Latest Unemployment", f"{fmt_val(bls_fetch_df.iloc[-1]['value'])}%")
-        m3.metric("BLS Series ID", series_id)
+    st.divider()
+    st.subheader(f"Unemployment — {sel_county if view_type == 'County' else bls_state}")
+    st.caption("Source: [U.S. Bureau of Labor Statistics - Local Area Unemployment Statistics](https://www.bls.gov/lau/)")
 
-        fig, ax = plt.subplots(figsize=(10, 3))
-        fig.patch.set_facecolor(app_background_color)
-        ax.set_facecolor(app_background_color)
-        ax.bar(bls_fetch_df["date"], bls_fetch_df["value"], color="#1f77b4", width=20)
-        ax.set_title(f"Unemployment Rate (%) — {sel_county if view_type == 'County' else bls_state}", color=text_color)
-        ax.set_xlabel("Notice Month", color=text_color)
-        ax.set_ylabel("Unemployment Rate (%)", color=text_color)
-        ax.tick_params(axis='x', colors=text_color)
-        ax.tick_params(axis='y', colors=text_color)
-        ax.grid(True, alpha=0.3, color=grid_color)
-        plt.tight_layout()
-        st.pyplot(fig)
+    if not bls_fetch_df.empty:
+        st.metric("Latest Unemployment", f"{fmt_val(bls_fetch_df.iloc[-1]['value'])}%")
+
+        unemployment_chart = (
+            alt.Chart(bls_fetch_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("date:T", title="Month"),
+                y=alt.Y("value:Q", title="Unemployment Rate (%)"),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Month"),
+                    alt.Tooltip("value:Q", title="Unemployment Rate", format=".1f")
+                ]
+            )
+            .properties(
+                title={
+                    "text": f"Unemployment Rate (%) — {sel_county if view_type == 'County' else bls_state}",
+                    "anchor": "middle"
+                }
+                # title=f"Unemployment Rate (%) — {sel_county if view_type == 'County' else bls_state}"
+            )
+        )
+
+        st.altair_chart(unemployment_chart, use_container_width=True)
 
     st.divider()
-    st.subheader(f"Population Context — {sel_county if view_type == 'County' else bls_state}")
+    st.subheader(f"Population — {sel_county if view_type == 'County' else bls_state}")
     st.caption("Source: [U.S. Census Bureau - ACS 5-Year Estimates](https://www.census.gov/data.html)")
     if not pop_df.empty:
         st.metric("Latest Population", f"{pop_df.iloc[-1]['population']:,}")
